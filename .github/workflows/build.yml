@@ -1,0 +1,191 @@
+name: Build OBS Studio + jellyfin-ffmpeg
+
+on:
+  # Poll for new OBS Studio releases. jellyfin-ffmpeg updates alone don't trigger
+  # a build; each build uses whatever jellyfin-ffmpeg release is current.
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      obs_version:
+        description: OBS Studio tag (empty = latest release)
+        required: false
+      jf_version:
+        description: jellyfin-ffmpeg tag (empty = latest release)
+        required: false
+      force:
+        description: Replace the release's packages if it already exists
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve versions
+    runs-on: ubuntu-latest
+    outputs:
+      obs_version: ${{ steps.v.outputs.obs_version }}
+      jf_version: ${{ steps.v.outputs.jf_version }}
+      tag: ${{ steps.v.outputs.tag }}
+      build: ${{ steps.v.outputs.build }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          OBS_INPUT: ${{ inputs.obs_version }}
+          JF_INPUT: ${{ inputs.jf_version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          obs="${OBS_INPUT:-$(gh api repos/obsproject/obs-studio/releases/latest --jq .tag_name)}"
+          jf="${JF_INPUT:-$(gh api repos/jellyfin/jellyfin-ffmpeg/releases/latest --jq .tag_name)}"
+          jf="v${jf#v}"
+          tag="obs-${obs}"
+
+          exists=false
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && exists=true
+
+          # Scheduled runs only build OBS releases that haven't been published yet.
+          # Manual runs always build; they publish if the release is new, or
+          # replace its packages when "force" is set.
+          build=true
+          [[ "$EVENT" == schedule && "$exists" == true ]] && build=false
+          publish=false
+          [[ "$exists" == false || "$FORCE" == true ]] && publish=true
+
+          {
+            echo "obs_version=$obs"
+            echo "jf_version=$jf"
+            echo "tag=$tag"
+            echo "build=$build"
+            echo "publish=$publish"
+          } | tee -a "$GITHUB_OUTPUT"
+          echo "OBS Studio **$obs** + jellyfin-ffmpeg **$jf** → \`$tag\` (exists: $exists, build: $build, publish: $publish)" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build (${{ matrix.distro }})
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: trixie
+            image: debian:trixie
+          - distro: resolute
+            image: ubuntu:resolute
+    env:
+      OBS_VERSION: ${{ needs.resolve.outputs.obs_version }}
+      JF_VERSION: ${{ needs.resolve.outputs.jf_version }}
+      GITHUB_TOKEN: ${{ github.token }}
+      WORK_DIR: /tmp/obs-jfmpp
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: ./scripts/build.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: deb-${{ matrix.distro }}
+          path: out/*.deb
+          if-no-files-found: error
+
+  test:
+    name: Test (${{ matrix.distro }})
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    # A clean container, so the package's declared dependencies are what's tested.
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: trixie
+            image: debian:trixie
+          - distro: resolute
+            image: ubuntu:resolute
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: deb-${{ matrix.distro }}
+          path: out
+
+      - name: Install and smoke test
+        run: ./scripts/test-deb.sh
+
+  release:
+    name: Publish release
+    needs: [resolve, test]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: deb-*
+          path: out
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          OBS: ${{ needs.resolve.outputs.obs_version }}
+          JF: ${{ needs.resolve.outputs.jf_version }}
+          PINNED: ${{ inputs.obs_version != '' }}
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum *.deb > SHA256SUMS
+          cat SHA256SUMS
+
+          cat > notes.md <<EOF
+          OBS Studio [$OBS](https://github.com/obsproject/obs-studio/releases/tag/$OBS) built against
+          [jellyfin-ffmpeg $JF](https://github.com/jellyfin/jellyfin-ffmpeg/releases/tag/$JF)
+          with Rockchip MPP/RGA for **arm64**: native *Rockchip MPP H.264/HEVC* encoders in Simple
+          and Advanced output mode, plus the browser source.
+
+          | File | Target |
+          |------|--------|
+          $(for f in *.deb; do d="${f%_arm64.deb}"; echo "| \`$f\` | ${d##*_} |"; done)
+
+          Install with \`sudo apt install ./obs-studio_*_<distro>_arm64.deb\`.
+          EOF
+
+          title="OBS Studio $OBS + jellyfin-ffmpeg $JF"
+
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Forced rebuild: asset names carry the jellyfin-ffmpeg version, so
+            # drop the old packages rather than relying on --clobber.
+            gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
+              while read -r asset; do
+                gh release delete-asset "$TAG" "$asset" -R "$GITHUB_REPOSITORY" --yes
+              done
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" *.deb SHA256SUMS
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --title "$title" --notes-file notes.md
+            exit 0
+          fi
+
+          latest=true
+          [[ "$PINNED" == true ]] && latest=false
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$title" \
+            --notes-file notes.md \
+            --latest="$latest" \
+            *.deb SHA256SUMS

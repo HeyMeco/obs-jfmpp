@@ -1,0 +1,185 @@
+diff --git a/frontend/data/locale/en-US.ini b/frontend/data/locale/en-US.ini
+index b5cc638..7a985ca 100644
+--- a/frontend/data/locale/en-US.ini
++++ b/frontend/data/locale/en-US.ini
+@@ -1096,6 +1096,8 @@ Basic.Settings.Output.Simple.Encoder.Hardware.NVENC.AV1="Hardware (NVENC, AV1)"
+ Basic.Settings.Output.Simple.Encoder.Hardware.NVENC.HEVC="Hardware (NVENC, HEVC)"
+ Basic.Settings.Output.Simple.Encoder.Hardware.Apple.H264="Hardware (Apple, H.264)"
+ Basic.Settings.Output.Simple.Encoder.Hardware.Apple.HEVC="Hardware (Apple, HEVC)"
++Basic.Settings.Output.Simple.Encoder.Hardware.RKMPP.H264="Hardware (Rockchip MPP, H.264)"
++Basic.Settings.Output.Simple.Encoder.Hardware.RKMPP.HEVC="Hardware (Rockchip MPP, HEVC)"
+ Basic.Settings.Output.Simple.Encoder.SoftwareLowCPU="Software (x264 low CPU usage preset, increases file size)"
+ Basic.Settings.Output.Simple.Codec.AAC="AAC"
+ Basic.Settings.Output.Simple.Codec.AAC.Default="AAC (Default)"
+diff --git a/frontend/settings/OBSBasicSettings.cpp b/frontend/settings/OBSBasicSettings.cpp
+index cace1de..9c2831f 100644
+--- a/frontend/settings/OBSBasicSettings.cpp
++++ b/frontend/settings/OBSBasicSettings.cpp
+@@ -3492,6 +3492,9 @@ void OBSBasicSettings::SaveOutputSettings()
+ 		presetType = "AMDPreset";
+ 	} else if (encoder == SIMPLE_ENCODER_AMD_AV1) {
+ 		presetType = "AMDAV1Preset";
++	} else if (encoder == SIMPLE_ENCODER_RKMPP || encoder == SIMPLE_ENCODER_RKMPP_HEVC) {
++		/* No presets; keeps the x264 preset from being overwritten. */
++		presetType = "RKMPPPreset";
+ 	} else if (encoder == SIMPLE_ENCODER_APPLE_H264
+ #ifdef ENABLE_HEVC
+ 		   || encoder == SIMPLE_ENCODER_APPLE_HEVC
+@@ -4980,6 +4983,12 @@ void OBSBasicSettings::FillSimpleRecordingValues()
+ 	if (EncoderAvailable("av1_texture_amf")) {
+ 		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.AMD.AV1"), QString(SIMPLE_ENCODER_AMD_AV1));
+ 	}
++	if (EncoderAvailable("ffmpeg_rkmpp_h264")) {
++		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.RKMPP.H264"), QString(SIMPLE_ENCODER_RKMPP));
++	}
++	if (EncoderAvailable("ffmpeg_rkmpp_hevc")) {
++		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.RKMPP.HEVC"), QString(SIMPLE_ENCODER_RKMPP_HEVC));
++	}
+ 	if (EncoderAvailable("com.apple.videotoolbox.videoencoder.ave.avc")
+ #ifndef __aarch64__
+ 	    && os_get_emulation_status() == true
+@@ -5091,7 +5100,8 @@ void OBSBasicSettings::SimpleStreamingEncoderChanged()
+ 
+ 		defaultPreset = "balanced";
+ 		preset = curAMDPreset;
+-	} else if (encoder == SIMPLE_ENCODER_APPLE_H264
++	} else if (encoder == SIMPLE_ENCODER_APPLE_H264 || encoder == SIMPLE_ENCODER_RKMPP ||
++		   encoder == SIMPLE_ENCODER_RKMPP_HEVC
+ #ifdef ENABLE_HEVC
+ 		   || encoder == SIMPLE_ENCODER_APPLE_HEVC
+ #endif
+diff --git a/frontend/settings/OBSBasicSettings_Stream.cpp b/frontend/settings/OBSBasicSettings_Stream.cpp
+index 2217ccd..a95d71b 100644
+--- a/frontend/settings/OBSBasicSettings_Stream.cpp
++++ b/frontend/settings/OBSBasicSettings_Stream.cpp
+@@ -1564,6 +1564,9 @@ static QString get_simple_fallback(const QString &enc)
+ 	if (enc == SIMPLE_ENCODER_QSV_AV1) {
+ 		return SIMPLE_ENCODER_QSV;
+ 	}
++	if (enc == SIMPLE_ENCODER_RKMPP_HEVC) {
++		return SIMPLE_ENCODER_RKMPP;
++	}
+ 	return SIMPLE_ENCODER_X264;
+ }
+ 
+@@ -1778,6 +1781,12 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
+ 	if (service_supports_encoder(vcodecs, "av1_texture_amf")) {
+ 		ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.AMD.AV1"), QString(SIMPLE_ENCODER_AMD_AV1));
+ 	}
++	if (service_supports_encoder(vcodecs, "ffmpeg_rkmpp_h264")) {
++		ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.RKMPP.H264"), QString(SIMPLE_ENCODER_RKMPP));
++	}
++	if (service_supports_encoder(vcodecs, "ffmpeg_rkmpp_hevc")) {
++		ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.RKMPP.HEVC"), QString(SIMPLE_ENCODER_RKMPP_HEVC));
++	}
+ /* Preprocessor guard required for the macOS version check */
+ #ifdef __APPLE__
+ 	if (service_supports_encoder(vcodecs, "com.apple.videotoolbox.videoencoder.ave.avc")
+diff --git a/frontend/utility/SimpleOutput.cpp b/frontend/utility/SimpleOutput.cpp
+index 718a363..a0f8d3d 100644
+--- a/frontend/utility/SimpleOutput.cpp
++++ b/frontend/utility/SimpleOutput.cpp
+@@ -114,6 +114,10 @@ const char *get_simple_output_encoder(const char *encoder)
+ #endif
+ 	} else if (strcmp(encoder, SIMPLE_ENCODER_NVENC_AV1) == 0) {
+ 		return "obs_nvenc_av1_tex";
++	} else if (strcmp(encoder, SIMPLE_ENCODER_RKMPP) == 0) {
++		return "ffmpeg_rkmpp_h264";
++	} else if (strcmp(encoder, SIMPLE_ENCODER_RKMPP_HEVC) == 0) {
++		return "ffmpeg_rkmpp_hevc";
+ 	} else if (strcmp(encoder, SIMPLE_ENCODER_APPLE_H264) == 0) {
+ 		return "com.apple.videotoolbox.videoencoder.ave.avc";
+ #ifdef ENABLE_HEVC
+@@ -531,6 +535,14 @@ void SimpleOutput::UpdateRecordingSettings_amd_cqp(int cqp)
+ 	obs_encoder_update(videoRecording, settings);
+ }
+ 
++void SimpleOutput::UpdateRecordingSettings_rkmpp_cqp(int cqp)
++{
++	OBSDataAutoRelease settings = obs_data_create();
++	obs_data_set_string(settings, "rate_control", "CQP");
++	obs_data_set_int(settings, "cqp", cqp);
++	obs_encoder_update(videoRecording, settings);
++}
++
+ void SimpleOutput::UpdateRecordingSettings()
+ {
+ 	bool ultra_hq = (videoQuality == "HQ");
+@@ -566,6 +578,9 @@ void SimpleOutput::UpdateRecordingSettings()
+ 	} else if (videoEncoder == SIMPLE_ENCODER_NVENC_AV1) {
+ 		UpdateRecordingSettings_nvenc_hevc_av1(crf);
+ 
++	} else if (videoEncoder == SIMPLE_ENCODER_RKMPP || videoEncoder == SIMPLE_ENCODER_RKMPP_HEVC) {
++		UpdateRecordingSettings_rkmpp_cqp(crf);
++
+ 	} else if (videoEncoder == SIMPLE_ENCODER_APPLE_H264) {
+ 		/* These are magic numbers. 0 - 100, more is better. */
+ 		UpdateRecordingSettings_apple(ultra_hq ? 70 : 50);
+diff --git a/frontend/utility/SimpleOutput.hpp b/frontend/utility/SimpleOutput.hpp
+index 46d6fc3..26c3b61 100644
+--- a/frontend/utility/SimpleOutput.hpp
++++ b/frontend/utility/SimpleOutput.hpp
+@@ -26,6 +26,7 @@ struct SimpleOutput : BasicOutputHandler {
+ 	void UpdateRecordingSettings_nvenc(int cqp);
+ 	void UpdateRecordingSettings_nvenc_hevc_av1(int cqp);
+ 	void UpdateRecordingSettings_amd_cqp(int cqp);
++	void UpdateRecordingSettings_rkmpp_cqp(int cqp);
+ 	void UpdateRecordingSettings_apple(int quality);
+ #ifdef ENABLE_HEVC
+ 	void UpdateRecordingSettings_apple_hevc(int quality);
+diff --git a/frontend/widgets/OBSBasic.hpp b/frontend/widgets/OBSBasic.hpp
+index 4343e16..2366143 100644
+--- a/frontend/widgets/OBSBasic.hpp
++++ b/frontend/widgets/OBSBasic.hpp
+@@ -84,6 +84,8 @@ enum class ItemPasteType { Invalid, Reference, Duplicate, Both };
+ #define SIMPLE_ENCODER_AMD_AV1 "amd_av1"
+ #define SIMPLE_ENCODER_APPLE_H264 "apple_h264"
+ #define SIMPLE_ENCODER_APPLE_HEVC "apple_hevc"
++#define SIMPLE_ENCODER_RKMPP "rkmpp"
++#define SIMPLE_ENCODER_RKMPP_HEVC "rkmpp_hevc"
+ 
+ #define PREVIEW_EDGE_SIZE 10
+ 
+diff --git a/frontend/widgets/OBSBasic_Profiles.cpp b/frontend/widgets/OBSBasic_Profiles.cpp
+index 836be77..e0b6932 100644
+--- a/frontend/widgets/OBSBasic_Profiles.cpp
++++ b/frontend/widgets/OBSBasic_Profiles.cpp
+@@ -799,6 +799,8 @@ void OBSBasic::CheckForSimpleModeX264Fallback()
+ #endif
+ 	bool amd_av1_supported = false;
+ 	bool apple_supported = false;
++	bool rkmpp_supported = false;
++	bool rkmpp_hevc_supported = false;
+ 	bool changed = false;
+ 	size_t idx = 0;
+ 	const char *id;
+@@ -812,6 +814,10 @@ void OBSBasic::CheckForSimpleModeX264Fallback()
+ 			qsv_av1_supported = true;
+ 		} else if (strcmp(id, "ffmpeg_nvenc") == 0) {
+ 			nve_supported = true;
++		} else if (strcmp(id, "ffmpeg_rkmpp_h264") == 0) {
++			rkmpp_supported = true;
++		} else if (strcmp(id, "ffmpeg_rkmpp_hevc") == 0) {
++			rkmpp_hevc_supported = true;
+ 		}
+ #ifdef ENABLE_HEVC
+ 		else if (strcmp(id, "h265_texture_amf") == 0) {
+@@ -883,6 +889,18 @@ void OBSBasic::CheckForSimpleModeX264Fallback()
+ 				name = SIMPLE_ENCODER_X264;
+ 				return false;
+ 			}
++		} else if (strcmp(name, SIMPLE_ENCODER_RKMPP) == 0) {
++			if (!rkmpp_supported) {
++				changed = true;
++				name = SIMPLE_ENCODER_X264;
++				return false;
++			}
++		} else if (strcmp(name, SIMPLE_ENCODER_RKMPP_HEVC) == 0) {
++			if (!rkmpp_hevc_supported) {
++				changed = true;
++				name = SIMPLE_ENCODER_X264;
++				return false;
++			}
+ 		} else if (strcmp(name, SIMPLE_ENCODER_APPLE_H264) == 0) {
+ 			if (!apple_supported) {
+ 				changed = true;

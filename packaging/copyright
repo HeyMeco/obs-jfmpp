@@ -1,0 +1,60 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: obs-studio (obs-jfmpp build)
+Source: https://github.com/obsproject/obs-studio
+Comment:
+ This binary package combines the components below. Because jellyfin-ffmpeg is
+ built with --enable-gpl --enable-version3, the combined work is distributed
+ under the GNU GPL version 3. The exact sources are the upstream tags named in
+ the package version, plus the build scripts and patches in
+ @SOURCE_URL@ (patches/obs-studio).
+
+Files: *
+Copyright: 2013-2026 OBS Project contributors (https://github.com/obsproject/obs-studio)
+License: GPL-2+
+
+Files: usr/lib/obs-jellyfin-ffmpeg/lib/libav* usr/lib/obs-jellyfin-ffmpeg/lib/libsw*
+       usr/lib/obs-jellyfin-ffmpeg/bin/*
+Copyright: 2000-2026 the FFmpeg developers
+           2019-2026 Jellyfin contributors (https://github.com/jellyfin/jellyfin-ffmpeg)
+License: GPL-3+
+
+Files: usr/lib/obs-jellyfin-ffmpeg/lib/librockchip_*
+Copyright: Rockchip Electronics Co., Ltd.
+Comment: Rockchip MPP, from https://github.com/nyanmisaka/rk-mirrors (jellyfin-mpp-next).
+ License texts are in /usr/share/doc/obs-studio/rockchip-mpp/.
+License: Apache-2.0 and MIT
+
+Files: usr/lib/obs-jellyfin-ffmpeg/lib/librga*
+Copyright: Rockchip Electronics Co., Ltd.
+Comment: Rockchip RGA, from https://github.com/nyanmisaka/rk-mirrors (jellyfin-rga-next)
+License: Apache-2.0
+
+Files: usr/lib/*/obs-plugins/libcef.so usr/lib/*/obs-plugins/libEGL.so
+       usr/lib/*/obs-plugins/libGLESv2.so usr/lib/*/obs-plugins/libvk_swiftshader.so
+       usr/lib/*/obs-plugins/libvulkan.so.1 usr/lib/*/obs-plugins/chrome-sandbox
+       usr/lib/*/obs-plugins/*.pak usr/lib/*/obs-plugins/*.bin
+       usr/lib/*/obs-plugins/icudtl.dat usr/lib/*/obs-plugins/locales/*
+Copyright: 2008-2026 Marshall A. Greenblatt; 2006-2026 The Chromium Authors
+Comment: Chromium Embedded Framework binary distribution from
+ https://cdn-fastly.obsproject.com/downloads/. See
+ /usr/share/doc/obs-studio/LICENSE.cef; Chromium's third-party licenses are
+ listed at chrome://credits.
+License: BSD-3-clause
+
+License: GPL-2+
+ On Debian systems, the complete text of the GNU General Public License
+ version 2 can be found in "/usr/share/common-licenses/GPL-2".
+
+License: GPL-3+
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in "/usr/share/common-licenses/GPL-3".
+
+License: Apache-2.0
+ On Debian systems, the complete text of the Apache License 2.0 can be found
+ in "/usr/share/common-licenses/Apache-2.0".
+
+License: MIT
+ See /usr/share/doc/obs-studio/rockchip-mpp/MIT.
+
+License: BSD-3-clause
+ See /usr/share/doc/obs-studio/LICENSE.cef.
