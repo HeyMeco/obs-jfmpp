@@ -197,7 +197,11 @@ jobs:
           title="OBS Studio $OBS + jellyfin-ffmpeg $JF"
 
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # Forced rebuild: asset names carry the jellyfin-ffmpeg version, so
+            # Forced rebuild: point the tag at the commit these packages were built from.
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+
+            # Asset names carry the jellyfin-ffmpeg version, so
             # drop the old packages rather than relying on --clobber.
             gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
               while read -r asset; do
