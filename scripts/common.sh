@@ -22,6 +22,15 @@ RKRGA_BRANCH="${RKRGA_BRANCH:-jellyfin-rga-next}"
 
 JOBS="${JOBS:-$(nproc)}"
 
+# Compile through ccache when it's installed. The cache lives in $WORK_DIR, which
+# docker-build.sh keeps on the host and CI restores with actions/cache.
+CCACHE="" CMAKE_CCACHE=()
+if command -v ccache >/dev/null; then
+  CCACHE=ccache
+  export CCACHE_DIR="${CCACHE_DIR:-$WORK_DIR/ccache}" CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-5G}"
+  CMAKE_CCACHE=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+fi
+
 # Source checkouts may be owned by another uid (e.g. bind-mounted into a container).
 export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'
 
@@ -73,16 +82,23 @@ obs_patch_dir() {
 # the same ref and replacing one of another (e.g. after switching OBS_VERSION).
 fetch_git() {
   local name="$1" repo="$2" ref="$3"; shift 3
-  local dest="$SRC_DIR/$name" current
+  local dest="$SRC_DIR/$name" current remote
   if [[ -d "$dest/.git" ]]; then
     current="$(cat "$dest/.git/fetched-ref" 2>/dev/null \
       || git -C "$dest" describe --tags --exact-match 2>/dev/null \
       || git -C "$dest" rev-parse --abbrev-ref HEAD)"
     if [[ "$current" == "$ref" ]]; then
-      log "Reusing $dest"
-      return
+      # Tags don't move, but branches (MPP/RGA) do: refetch when the branch head
+      # changed upstream. Offline, or for a tag, ls-remote finds nothing; keep it.
+      remote="$(git ls-remote "$repo" "refs/heads/$ref" 2>/dev/null | cut -f1)"
+      if [[ -z "$remote" || "$remote" == "$(git -C "$dest" rev-parse HEAD)" ]]; then
+        log "Reusing $dest"
+        return
+      fi
+      log "Replacing $dest: $ref moved upstream to ${remote:0:12}"
+    else
+      log "Replacing $dest ($current) with $ref"
     fi
-    log "Replacing $dest ($current) with $ref"
     rm -rf "$dest"
   fi
   mkdir -p "$SRC_DIR"

@@ -8,6 +8,14 @@ export DEBIAN_FRONTEND=noninteractive
 SUDO=""
 [[ $EUID -ne 0 ]] && SUDO="sudo"
 
+# The builder image of docker-build.sh already ran this exact script.
+STAMP=/var/lib/obs-jfmpp-deps
+stamp="$(sha256sum "$0" | cut -d' ' -f1)"
+if [[ "$(cat "$STAMP" 2>/dev/null)" == "$stamp" ]]; then
+  log "Build dependencies already installed"
+  exit 0
+fi
+
 # Ubuntu keeps some of these in universe; make sure it is enabled.
 if grep -qi ubuntu /etc/os-release; then
   $SUDO sed -i 's/^Components: main.*$/Components: main restricted universe multiverse/' \
@@ -30,7 +38,7 @@ pick() {
 
 tools=(
   build-essential cmake ninja-build meson pkgconf git ca-certificates curl jq xz-utils
-  quilt nasm patchelf dpkg-dev file python3
+  quilt nasm patchelf dpkg-dev file python3 ccache
 )
 
 ffmpeg_deps=(
@@ -62,3 +70,5 @@ $SUDO apt-get install -y --no-install-recommends "${tools[@]}" "${ffmpeg_deps[@]
 if dpkg-query -W -f='${Status}\n' libavcodec-dev 2>/dev/null | grep -q 'ok installed'; then
   die "libavcodec-dev got pulled in; OBS could pick up the distro FFmpeg headers"
 fi
+
+echo "$stamp" | $SUDO tee "$STAMP" >/dev/null

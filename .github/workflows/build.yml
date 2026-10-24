@@ -32,6 +32,7 @@ jobs:
     outputs:
       obs_version: ${{ steps.v.outputs.obs_version }}
       jf_version: ${{ steps.v.outputs.jf_version }}
+      rk_commits: ${{ steps.v.outputs.rk_commits }}
       tag: ${{ steps.v.outputs.tag }}
       build: ${{ steps.v.outputs.build }}
       publish: ${{ steps.v.outputs.publish }}
@@ -49,6 +50,10 @@ jobs:
           jf="${JF_INPUT:-$(gh api repos/jellyfin/jellyfin-ffmpeg/releases/latest --jq .tag_name)}"
           jf="v${jf#v}"
           tag="obs-${obs}"
+          # MPP/RGA branch heads (repo and branches as in scripts/common.sh), for the
+          # FFmpeg cache key: the branches move without new jellyfin-ffmpeg releases.
+          mpp="$(gh api repos/nyanmisaka/rk-mirrors/commits/jellyfin-mpp-next --jq .sha)"
+          rga="$(gh api repos/nyanmisaka/rk-mirrors/commits/jellyfin-rga-next --jq .sha)"
 
           exists=false
           gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && exists=true
@@ -64,6 +69,7 @@ jobs:
           {
             echo "obs_version=$obs"
             echo "jf_version=$jf"
+            echo "rk_commits=${mpp:0:12}-${rga:0:12}"
             echo "tag=$tag"
             echo "build=$build"
             echo "publish=$publish"
@@ -90,8 +96,29 @@ jobs:
       JF_VERSION: ${{ needs.resolve.outputs.jf_version }}
       GITHUB_TOKEN: ${{ github.token }}
       WORK_DIR: /tmp/obs-jfmpp
+      # Keeps both distros' caches well inside the repository's 10 GB cache quota.
+      CCACHE_MAXSIZE: 2G
     steps:
       - uses: actions/checkout@v7
+
+      # jellyfin-ffmpeg + MPP/RGA only change with their versions; build-ffmpeg.sh
+      # skips the build when the restored copy matches and still runs.
+      - name: Cache jellyfin-ffmpeg
+        uses: actions/cache@v6
+        with:
+          path: /usr/lib/obs-jellyfin-ffmpeg
+          key: ffmpeg-${{ matrix.distro }}-${{ needs.resolve.outputs.jf_version }}-${{ needs.resolve.outputs.rk_commits }}-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+
+      # Compiler cache for whatever does get built (OBS, mostly). Saved under a new key
+      # each run and restored from the newest entry, preferring the same OBS release.
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.WORK_DIR }}/ccache
+          key: ccache-${{ matrix.distro }}-${{ needs.resolve.outputs.obs_version }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ matrix.distro }}-${{ needs.resolve.outputs.obs_version }}-
+            ccache-${{ matrix.distro }}-
 
       - name: Build
         run: ./scripts/build.sh

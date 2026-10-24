@@ -5,27 +5,45 @@ resolve_versions
 
 [[ "$(deb_arch)" == arm64 ]] || die "rkmpp is only available on arm64 (got $(deb_arch))"
 
+fetch_git rkmpp "$RKMPP_REPO" "$RKMPP_BRANCH"
+fetch_git rkrga "$RKRGA_REPO" "$RKRGA_BRANCH"
+
+# Skip the build when $FFMPEG_PREFIX already holds this exact build (CI restores it
+# from its cache) and still runs against the distro's current libraries.
+build_id="$JF_VERSION mpp-$(git -C "$SRC_DIR/rkmpp" rev-parse HEAD)"
+build_id+=" rga-$(git -C "$SRC_DIR/rkrga" rev-parse HEAD) script-$(sha256sum "$0" | cut -c1-16)"
+if [[ "$(cat "$FFMPEG_PREFIX/.build-id" 2>/dev/null)" == "$build_id" ]]; then
+  encoders="$("$FFMPEG_PREFIX/bin/ffmpeg" -hide_banner -encoders 2>/dev/null || true)"
+  if grep -q ' h264_rkmpp ' <<<"$encoders"; then
+    log "Reusing jellyfin-ffmpeg in $FFMPEG_PREFIX ($build_id)"
+    exit 0
+  fi
+fi
+
 SUDO=""
 [[ $EUID -ne 0 ]] && SUDO="sudo"
+# Start empty so files of an older build don't end up in the package. Only a prefix
+# this script filled (it has a .build-id) is wiped, never one set to e.g. /usr.
+# Its contents only: docker-build.sh bind-mounts the prefix, so the directory stays.
+if [[ -f "$FFMPEG_PREFIX/.build-id" ]]; then $SUDO find "$FFMPEG_PREFIX" -mindepth 1 -delete; fi
 $SUDO mkdir -p "$FFMPEG_PREFIX"
 $SUDO chown "$(id -u):$(id -g)" "$FFMPEG_PREFIX"
 
 export PKG_CONFIG_PATH="$FFMPEG_PREFIX/lib/pkgconfig"
 
 group "Rockchip MPP ($RKMPP_BRANCH)"
-fetch_git rkmpp "$RKMPP_REPO" "$RKMPP_BRANCH"
 cmake -S "$SRC_DIR/rkmpp" -B "$WORK_DIR/rkmpp" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$FFMPEG_PREFIX" \
   -DCMAKE_INSTALL_LIBDIR=lib \
   -DBUILD_SHARED_LIBS=ON \
-  -DBUILD_TEST=OFF
+  -DBUILD_TEST=OFF \
+  "${CMAKE_CCACHE[@]}"
 cmake --build "$WORK_DIR/rkmpp" -j "$JOBS"
 cmake --install "$WORK_DIR/rkmpp"
 endgroup
 
 group "Rockchip RGA ($RKRGA_BRANCH)"
-fetch_git rkrga "$RKRGA_REPO" "$RKRGA_BRANCH"
 [[ -d "$WORK_DIR/rkrga" ]] || meson setup "$WORK_DIR/rkrga" "$SRC_DIR/rkrga" \
   --prefix="$FFMPEG_PREFIX" \
   --libdir=lib \
@@ -54,6 +72,7 @@ config=(
   --target-os=linux
   --arch=arm64
   --disable-doc
+  --disable-debug  # no -g: the packaging strips everything anyway
   --disable-ffplay
   --disable-static
   --enable-shared
@@ -84,6 +103,7 @@ config=(
   --enable-libzimg
   --enable-libsrt
 )
+[[ -z "$CCACHE" ]] || config+=(--cc="ccache gcc" --cxx="ccache g++")
 ./configure "${config[@]}" || { tail -n 50 ffbuild/config.log; exit 1; }
 make -j "$JOBS"
 make install
@@ -91,4 +111,5 @@ endgroup
 
 encoders="$("$FFMPEG_PREFIX/bin/ffmpeg" -hide_banner -encoders)"
 grep -q ' h264_rkmpp ' <<<"$encoders" || die "built ffmpeg has no h264_rkmpp encoder"
+echo "$build_id" > "$FFMPEG_PREFIX/.build-id"
 log "jellyfin-ffmpeg installed to $FFMPEG_PREFIX"

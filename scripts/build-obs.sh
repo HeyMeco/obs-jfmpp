@@ -75,8 +75,12 @@ fi
 mkdir -p "$WORK_DIR/obs"
 echo "$build_id" > "$WORK_DIR/obs/.build-id"
 export PKG_CONFIG_PATH="$FFMPEG_PREFIX/lib/pkgconfig"
+# RelWithDebInfo without its -g: the install and the packaging strip the debug info
+# anyway, so generating it only slows down compiling and linking.
 cmake -S "$SRC_DIR/obs-studio" -B "$WORK_DIR/obs" -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_C_FLAGS_RELWITHDEBINFO="-O2 -DNDEBUG" \
+  -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O2 -DNDEBUG" \
   -DCMAKE_INSTALL_PREFIX=/usr \
   -DCMAKE_INSTALL_LIBDIR="lib/$(multiarch)" \
   -DCMAKE_PREFIX_PATH="$FFMPEG_PREFIX" \
@@ -92,7 +96,8 @@ cmake -S "$SRC_DIR/obs-studio" -B "$WORK_DIR/obs" -G Ninja \
   -DENABLE_WAYLAND=ON \
   -DENABLE_PIPEWIRE=ON \
   -DENABLE_JACK=ON \
-  -DENABLE_SNDIO=ON
+  -DENABLE_SNDIO=ON \
+  "${CMAKE_CCACHE[@]}"
 
 # Make sure OBS really picked up jellyfin-ffmpeg and not something else.
 grep -E '^FFmpeg_avcodec_INCLUDE_DIR' "$WORK_DIR/obs/CMakeCache.txt" | grep -q "$FFMPEG_PREFIX" \

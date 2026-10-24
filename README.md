@@ -229,7 +229,17 @@ Needs Docker on an arm64 host (or with arm64 emulation, which is much slower):
 OBS_VERSION=32.2.2 JF_VERSION=v8.1.3-1 ./scripts/docker-build.sh trixie
 ```
 
-The `.deb` lands in `out/`. Inside a Trixie/Resolute arm64 system or container you can run
+The `.deb` lands in `out/`. The build runs in an `obs-jfmpp-builder:<distro>-<hash>` image
+with the dependencies preinstalled; it is rebuilt only when `scripts/install-deps.sh` changes.
+Everything worth keeping between runs stays in `_build/<distro>/`: sources, build
+directories, CEF, the ccache, and the installed jellyfin-ffmpeg (`ffmpeg-prefix/`, mounted at
+`/usr/lib/obs-jellyfin-ffmpeg`). So MPP, RGA and jellyfin-ffmpeg are only rebuilt when their
+version, the MPP/RGA branch heads or `build-ffmpeg.sh` change. CI does the same with
+`actions/cache`. Delete `_build/<distro>` to start from scratch.
+
+On macOS, Colima with `--vm-type vz --mount-type virtiofs` is much faster than QEMU/sshfs.
+
+Inside a Trixie/Resolute arm64 system or container you can run
 `./scripts/build.sh` directly (uses `sudo` for apt and for creating
 `/usr/lib/obs-jellyfin-ffmpeg`).
 
