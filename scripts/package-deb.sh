@@ -44,6 +44,11 @@ install -Dm644 "$REPO_ROOT/packaging/70-obs-jfmpp-rockchip.rules" \
   "$STAGE/usr/lib/udev/rules.d/70-obs-jfmpp-rockchip.rules"
 endgroup
 
+group "Leave the HDMI-in audio card to OBS (WirePlumber)"
+install -Dm644 "$REPO_ROOT/packaging/wireplumber-hdmiin.conf" \
+  "$STAGE/usr/share/wireplumber/wireplumber.conf.d/50-obs-jfmpp-hdmiin.conf"
+endgroup
+
 group "Keep apt from replacing this build"
 # Not listed as a conffile, so dpkg deletes it on remove, not just on purge.
 install -Dm644 "$REPO_ROOT/packaging/apt-preferences" "$STAGE/etc/apt/preferences.d/obs-jfmpp"

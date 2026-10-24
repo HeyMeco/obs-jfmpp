@@ -12,10 +12,10 @@ index 397b703..2317dc2 100644
  add_core_module(text-freetype2)
 diff --git a/plugins/rockchip-hdmirx/CMakeLists.txt b/plugins/rockchip-hdmirx/CMakeLists.txt
 new file mode 100644
-index 0000000..55b0df2
+index 0000000..b123b3d
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/CMakeLists.txt
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,31 @@
 +cmake_minimum_required(VERSION 3.28...3.30)
 +
 +option(ENABLE_ROCKCHIP_HDMIRX "Build OBS with Rockchip HDMI input support" ON)
@@ -29,7 +29,9 @@ index 0000000..55b0df2
 +
 +target_sources(rockchip-hdmirx PRIVATE hdmirx-edid.h rockchip-hdmirx.c)
 +
-+target_link_libraries(rockchip-hdmirx PRIVATE OBS::libobs)
++find_package(ALSA REQUIRED)
++
++target_link_libraries(rockchip-hdmirx PRIVATE OBS::libobs ALSA::ALSA)
 +
 +# RGA3 unpacks 10-bit input (NV15/NV20) for the GPU; without librga only 8-bit
 +# signals are supported.
@@ -182,10 +184,10 @@ index 0000000..e41bbe4
 +}
 diff --git a/plugins/rockchip-hdmirx/data/locale/en-US.ini b/plugins/rockchip-hdmirx/data/locale/en-US.ini
 new file mode 100644
-index 0000000..26cf608
+index 0000000..61b2eaa
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/data/locale/en-US.ini
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,45 @@
 +RockchipHdmiRx="Rockchip HDMI Input"
 +Device="Device"
 +NoDevice="No Rockchip HDMI input found"
@@ -222,6 +224,15 @@ index 0000000..26cf608
 +Yes="Yes"
 +No="No"
 +EdidNoHdr="the receiver's EDID doesn't offer HDR"
++DecodeHdr="Decode HDR"
++DecodeHdr.Description="Decodes HDR10 (PQ) signals to linear Rec. 709, so OBS tone-maps them for SDR canvases and passes them through to HDR canvases. When off, the PQ-encoded Rec. 2020 values are passed through untouched as SDR (they look washed out), e.g. to tone-map them with a LUT or record the signal as is."
++HdrPassedThrough="passed through undecoded"
++Connect="Connect"
++Disconnect="Disconnect"
++Disconnected="Disconnected"
++Audio="Audio"
++CaptureAudio="Capture HDMI audio"
++CaptureAudio.Description="Records the audio of the HDMI signal from the receiver's ALSA device (rockchip,hdmiin), and reopens it whenever the HDMI source re-detects the receiver. Other programs can't use that device meanwhile; the package tells PipeWire to leave it alone."
 diff --git a/plugins/rockchip-hdmirx/hdmirx-edid.h b/plugins/rockchip-hdmirx/hdmirx-edid.h
 new file mode 100644
 index 0000000..d68f297
@@ -288,10 +299,10 @@ index 0000000..d68f297
 +};
 diff --git a/plugins/rockchip-hdmirx/rockchip-hdmirx.c b/plugins/rockchip-hdmirx/rockchip-hdmirx.c
 new file mode 100644
-index 0000000..3362ac3
+index 0000000..14fe3ff
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/rockchip-hdmirx.c
-@@ -0,0 +1,1566 @@
+@@ -0,0 +1,1971 @@
 +/*
 + * Rockchip HDMI input (rk_hdmirx) source.
 + *
@@ -306,7 +317,15 @@ index 0000000..3362ac3
 + *
 + * HDR10 (PQ) signals are decoded to linear Rec. 709 in the shader and reported
 + * to OBS as an extended-range source, so OBS tone-maps them for SDR output and
-+ * passes them through to HDR canvases.
++ * passes them through to HDR canvases. With "Decode HDR" off, the PQ-encoded
++ * Rec. 2020 values pass through untouched as an SDR source instead.
++ *
++ * HDMI audio arrives on a separate ALSA card (rockchip,hdmiin). Whenever the
++ * HDMI source re-detects the receiver (cable replug, EDID switch, receiver
++ * reset) the vendor kernel marks an open capture stream as disconnected, and
++ * it only works again after it was closed and reopened. PipeWire doesn't do
++ * that and loops on the error, so the source records the card itself and
++ * reopens it as needed; the package tells WirePlumber to leave the card alone.
 + */
 +
 +#include <obs-module.h>
@@ -314,7 +333,9 @@ index 0000000..3362ac3
 +#include <util/dstr.h>
 +#include <util/platform.h>
 +#include <util/threading.h>
++#include <util/util_uint64.h>
 +
++#include <alsa/asoundlib.h>
 +#include <dirent.h>
 +#include <errno.h>
 +#include <fcntl.h>
@@ -383,11 +404,17 @@ index 0000000..3362ac3
 +};
 +_Static_assert(sizeof(struct rk_hdr_metadata) == 26, "struct hdr_metadata_infoframe layout");
 +
++/* From the vendor kernel's include/media/v4l2-controls_rockchip.h. */
++#define RK_V4L2_CID_AUDIO_SAMPLING_RATE (V4L2_CID_USER_BASE + 0x1180)
++#define RK_V4L2_CID_AUDIO_PRESENT (V4L2_CID_USER_BASE + 0x1181)
++
++#define RK_HDMIRX_CMD_SET_AUDIO_STATE _IOW('V', BASE_VIDIOC_PRIVATE + 5, int)
 +#define RK_HDMIRX_CMD_SOFT_RESET _IO('V', BASE_VIDIOC_PRIVATE + 6)
 +#define RK_HDMIRX_CMD_GET_COLOR_RANGE _IOR('V', BASE_VIDIOC_PRIVATE + 9, int)
 +#define RK_HDMIRX_CMD_GET_COLOR_SPACE _IOR('V', BASE_VIDIOC_PRIVATE + 10, int)
 +#define RK_HDMIRX_CMD_GET_HDR_METADATA _IOR('V', BASE_VIDIOC_PRIVATE + 18, struct rk_hdr_metadata)
 +#define HDMI_EOTF_SMPTE_ST2084 2
++#define RK_HDMIRX_AUDIO_ON 1
 +
 +/* EDID presets, numbered like the driver's sysfs "edid" attribute. */
 +enum edid_mode {
@@ -401,6 +428,15 @@ index 0000000..3362ac3
 +/* How often the capture thread re-reads the infoframes; sources switch HDR on
 + * and off without changing the timings. */
 +#define COLOR_POLL_MS 1000
++
++/* HDMI audio: how often the audio thread re-reads the receiver's audio state,
++ * and how long it waits for samples before reopening the card. The receiver
++ * clocks the I2S, so a stream without an HDMI audio signal never delivers. */
++#define AUDIO_CHECK_MS 1000
++#define AUDIO_STALL_MS 2000
++#define AUDIO_CHANNELS 2
++#define AUDIO_PERIOD_FRAMES 512
++#define AUDIO_PERIODS 8
 +
 +struct gpu_plane {
 +	uint32_t drm_format;
@@ -440,6 +476,13 @@ index 0000000..3362ac3
 +	obs_source_t *source;
 +	char *device;
 +	enum edid_mode edid_setting; /* preset to keep on the receiver */
++	bool disconnected;           /* by the Disconnect button, UI thread only */
++	bool audio_enabled;          /* setting: record the HDMI-in ALSA card */
++
++	pthread_t audio_thread;
++	bool audio_thread_running;
++	volatile bool audio_stop;
++	int audio_wake_fd;
 +
 +	pthread_t thread;
 +	bool thread_running;
@@ -464,7 +507,8 @@ index 0000000..3362ac3
 +	float color_range_max[3];
 +	enum video_colorspace colorspace;
 +	enum video_range_type range;
-+	bool pq;          /* HDR10: decode PQ to linear Rec. 709 */
++	bool pq;          /* the signal is HDR10 */
++	bool decode_pq;   /* setting: decode PQ to linear Rec. 709, else pass it through */
 +	uint16_t max_cll; /* content light level from the infoframe, 0 if unknown */
 +	uint64_t frames_captured;
 +	uint64_t frames_dropped; /* replaced before video_tick picked them up */
@@ -474,6 +518,11 @@ index 0000000..3362ac3
 +	/* Written by the capture thread, read by the properties. */
 +	struct dstr last_status;
 +	int last_status_level;
++
++	/* Written by the audio thread, read by the properties. */
++	struct dstr audio_status;
++	int audio_status_level;
++	uint32_t audio_rate; /* 0 while not recording */
 +	enum edid_mode edid_current; /* EDID the receiver presents, as of the last check */
 +
 +	/* capture thread only */
@@ -1385,8 +1434,283 @@ index 0000000..3362ac3
 +	return NULL;
 +}
 +
++/* --- HDMI audio --------------------------------------------------------- */
++
++/* Like set_status, for the audio thread. */
++static void set_audio_status(struct hdmirx_source *s, int level, const char *status)
++{
++	pthread_mutex_lock(&s->mutex);
++	if (s->audio_status.array && strcmp(s->audio_status.array, status) == 0) {
++		pthread_mutex_unlock(&s->mutex);
++		return;
++	}
++	dstr_copy(&s->audio_status, status);
++	s->audio_status_level = level;
++	pthread_mutex_unlock(&s->mutex);
++
++	blog_s(s, level, "Audio: %s", status);
++	obs_source_update_properties(s->source);
++}
++
++static void audio_wait_ms(struct hdmirx_source *s, int ms)
++{
++	struct pollfd pfd = {.fd = s->audio_wake_fd, .events = POLLIN};
++	if (!s->audio_stop) {
++		poll(&pfd, 1, ms);
++	}
++}
++
++/* The receiver's audio sample rate, or 0 while the HDMI signal has no audio. */
++static uint32_t read_audio_rate(int vfd)
++{
++	struct v4l2_control present = {.id = RK_V4L2_CID_AUDIO_PRESENT};
++	struct v4l2_control rate = {.id = RK_V4L2_CID_AUDIO_SAMPLING_RATE};
++
++	if (xioctl(vfd, VIDIOC_G_CTRL, &present) < 0 || !present.value || xioctl(vfd, VIDIOC_G_CTRL, &rate) < 0 ||
++	    rate.value < 32000 || rate.value > 192000) {
++		return 0;
++	}
++	return (uint32_t)rate.value;
++}
++
++static bool find_audio_card(char *name, size_t size)
++{
++	int card = -1;
++
++	while (snd_card_next(&card) == 0 && card >= 0) {
++		char *card_name = NULL;
++		bool match = snd_card_get_name(card, &card_name) == 0 && strstr(card_name, "hdmiin");
++		free(card_name);
++		if (match) {
++			snprintf(name, size, "hw:%d,0", card);
++			return true;
++		}
++	}
++	return false;
++}
++
++static snd_pcm_t *open_audio(struct hdmirx_source *s, const char *name, uint32_t rate)
++{
++	snd_pcm_hw_params_t *hw;
++	snd_pcm_sw_params_t *sw;
++	snd_pcm_uframes_t period = AUDIO_PERIOD_FRAMES, buffer = AUDIO_PERIOD_FRAMES * AUDIO_PERIODS;
++	struct dstr status = {0};
++	snd_pcm_t *pcm;
++	int err;
++
++	err = snd_pcm_open(&pcm, name, SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK);
++	if (err < 0) {
++		if (err == -EBUSY) {
++			set_audio_status(s, LOG_WARNING,
++					 "the HDMI audio device is in use by another program, e.g. PipeWire");
++		} else {
++			dstr_printf(&status, "unable to open %s: %s", name, snd_strerror(err));
++			set_audio_status(s, LOG_WARNING, status.array);
++		}
++		dstr_free(&status);
++		return NULL;
++	}
++
++	snd_pcm_hw_params_alloca(&hw);
++	snd_pcm_sw_params_alloca(&sw);
++	if ((err = snd_pcm_hw_params_any(pcm, hw)) < 0 ||
++	    (err = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0 ||
++	    (err = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S32_LE)) < 0 ||
++	    (err = snd_pcm_hw_params_set_channels(pcm, hw, AUDIO_CHANNELS)) < 0 ||
++	    (err = snd_pcm_hw_params_set_rate(pcm, hw, rate, 0)) < 0 ||
++	    (err = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, NULL)) < 0 ||
++	    (err = snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer)) < 0 ||
++	    (err = snd_pcm_hw_params(pcm, hw)) < 0 || (err = snd_pcm_sw_params_current(pcm, sw)) < 0 ||
++	    (err = snd_pcm_sw_params_set_avail_min(pcm, sw, period)) < 0 || (err = snd_pcm_sw_params(pcm, sw)) < 0 ||
++	    (err = snd_pcm_start(pcm)) < 0) {
++		dstr_printf(&status, "unable to set up %s for %u Hz: %s", name, rate, snd_strerror(err));
++		set_audio_status(s, LOG_WARNING, status.array);
++		dstr_free(&status);
++		snd_pcm_close(pcm);
++		return NULL;
++	}
++	return pcm;
++}
++
++/* Records until the stream fails, stalls or the receiver's audio changes. */
++static void audio_run(struct hdmirx_source *s, snd_pcm_t *pcm, int vfd, uint32_t rate)
++{
++	int32_t data[AUDIO_PERIOD_FRAMES * AUDIO_CHANNELS];
++	int nfds = snd_pcm_poll_descriptors_count(pcm);
++	struct pollfd pfd[8];
++	uint64_t checked_ns = os_gettime_ns(), data_ns = checked_ns;
++	bool receiving = false;
++
++	if (nfds < 1 || nfds > 7) {
++		return;
++	}
++	snd_pcm_poll_descriptors(pcm, pfd, (unsigned int)nfds);
++	pfd[nfds] = (struct pollfd){.fd = s->audio_wake_fd, .events = POLLIN};
++
++	while (!s->audio_stop) {
++		uint64_t now = os_gettime_ns();
++		if (now - checked_ns >= AUDIO_CHECK_MS * 1000000ULL) {
++			checked_ns = now;
++			if (read_audio_rate(vfd) != rate) {
++				return;
++			}
++		}
++		if (now - data_ns >= AUDIO_STALL_MS * 1000000ULL) {
++			set_audio_status(s, LOG_INFO, "no samples from the HDMI receiver");
++			return;
++		}
++
++		if (poll(pfd, (nfds_t)nfds + 1, 200) < 0 && errno != EINTR) {
++			return;
++		}
++		if (s->audio_stop) {
++			return;
++		}
++
++		snd_pcm_sframes_t frames;
++		while ((frames = snd_pcm_readi(pcm, data, AUDIO_PERIOD_FRAMES)) > 0) {
++			snd_pcm_sframes_t delay = 0;
++			if (snd_pcm_delay(pcm, &delay) < 0 || delay < 0) {
++				delay = 0;
++			}
++			struct obs_source_audio audio = {
++				.data = {(const uint8_t *)data},
++				.frames = (uint32_t)frames,
++				.speakers = SPEAKERS_STEREO,
++				.format = AUDIO_FORMAT_32BIT,
++				.samples_per_sec = rate,
++				/* when the first of these frames was captured */
++				.timestamp = os_gettime_ns() - util_mul_div64((uint64_t)(frames + delay), 1000000000ULL, rate),
++			};
++			obs_source_output_audio(s->source, &audio);
++			data_ns = os_gettime_ns();
++
++			if (!receiving) {
++				struct dstr status = {0};
++				receiving = true;
++				dstr_printf(&status, "recording %u Hz stereo", rate);
++				pthread_mutex_lock(&s->mutex);
++				s->audio_rate = rate;
++				pthread_mutex_unlock(&s->mutex);
++				set_audio_status(s, LOG_INFO, status.array);
++				dstr_free(&status);
++			}
++		}
++
++		if (frames == -EAGAIN) {
++			continue;
++		}
++		if (frames == -EPIPE || frames == -ESTRPIPE) {
++			/* overrun: OBS didn't read for a while, carry on */
++			if (snd_pcm_prepare(pcm) == 0 && snd_pcm_start(pcm) == 0) {
++				continue;
++			}
++		}
++		/* -EBADFD: the kernel disconnected the stream when the HDMI source
++		 * re-detected the receiver; it needs reopening. */
++		struct dstr status = {0};
++		dstr_printf(&status, "stream stopped (%s), reopening", snd_strerror((int)frames));
++		set_audio_status(s, LOG_INFO, status.array);
++		dstr_free(&status);
++		return;
++	}
++}
++
++static void *audio_thread(void *data)
++{
++	struct hdmirx_source *s = data;
++	char name[32];
++	int vfd = -1;
++
++	os_set_thread_name("rockchip-hdmirx-audio");
++
++	while (!s->audio_stop) {
++		if (vfd < 0) {
++			vfd = open(s->device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++		}
++		if (!find_audio_card(name, sizeof(name))) {
++			set_audio_status(s, LOG_WARNING, "no HDMI-in audio device (rockchip,hdmiin) found");
++			audio_wait_ms(s, RETRY_MS * 5);
++			continue;
++		}
++
++		uint32_t rate = vfd >= 0 ? read_audio_rate(vfd) : 0;
++		if (!rate && vfd >= 0) {
++			/* The driver starts its audio monitor from an interrupt that may
++			 * never come (on an RK3588 with a Mac attached it didn't), and
++			 * then never notices the audio. Start it explicitly; once running
++			 * it reschedules itself until the next hotplug. */
++			int on = RK_HDMIRX_AUDIO_ON;
++			xioctl(vfd, RK_HDMIRX_CMD_SET_AUDIO_STATE, &on);
++			audio_wait_ms(s, AUDIO_CHECK_MS);
++			rate = read_audio_rate(vfd);
++		}
++		if (!rate) {
++			set_audio_status(s, LOG_INFO, "the HDMI signal carries no audio");
++			audio_wait_ms(s, AUDIO_CHECK_MS / 2);
++			continue;
++		}
++
++		snd_pcm_t *pcm = open_audio(s, name, rate);
++		if (pcm) {
++			audio_run(s, pcm, vfd, rate);
++			snd_pcm_close(pcm);
++			pthread_mutex_lock(&s->mutex);
++			s->audio_rate = 0;
++			pthread_mutex_unlock(&s->mutex);
++			audio_wait_ms(s, 200);
++		} else {
++			audio_wait_ms(s, RETRY_MS);
++		}
++	}
++
++	if (vfd >= 0) {
++		close(vfd);
++	}
++	return NULL;
++}
++
++static void stop_audio(struct hdmirx_source *s)
++{
++	if (!s->audio_thread_running) {
++		return;
++	}
++	s->audio_stop = true;
++	uint64_t one = 1;
++	if (write(s->audio_wake_fd, &one, sizeof(one)) < 0) {
++		blog_s(s, LOG_WARNING, "Unable to wake audio thread");
++	}
++	pthread_join(s->audio_thread, NULL);
++	s->audio_thread_running = false;
++
++	uint64_t drain;
++	if (read(s->audio_wake_fd, &drain, sizeof(drain)) < 0 && errno != EAGAIN) {
++		blog_s(s, LOG_WARNING, "Unable to reset audio wake event");
++	}
++}
++
++static void start_audio(struct hdmirx_source *s)
++{
++	if (s->audio_thread_running || !s->device || !*s->device) {
++		return;
++	}
++	s->audio_stop = false;
++	pthread_mutex_lock(&s->mutex);
++	dstr_free(&s->audio_status);
++	s->audio_rate = 0;
++	pthread_mutex_unlock(&s->mutex);
++	if (pthread_create(&s->audio_thread, NULL, audio_thread, s) == 0) {
++		s->audio_thread_running = true;
++	} else {
++		blog_s(s, LOG_ERROR, "Unable to start audio thread");
++	}
++}
++
++/* --- capture thread control --------------------------------------------- */
++
 +static void stop_capture(struct hdmirx_source *s)
 +{
++	stop_audio(s);
 +	if (!s->thread_running) {
 +		return;
 +	}
@@ -1414,6 +1738,9 @@ index 0000000..3362ac3
 +		s->thread_running = true;
 +	} else {
 +		blog_s(s, LOG_ERROR, "Unable to start capture thread");
++	}
++	if (s->audio_enabled) {
++		start_audio(s);
 +	}
 +}
 +
@@ -1489,12 +1816,22 @@ index 0000000..3362ac3
 +	enum edid_mode edid = (enum edid_mode)obs_data_get_int(settings, "edid");
 +	char *detected = NULL;
 +
++	pthread_mutex_lock(&s->mutex);
++	s->decode_pq = obs_data_get_bool(settings, "decode_hdr");
++	pthread_mutex_unlock(&s->mutex);
++	s->audio_enabled = obs_data_get_bool(settings, "audio");
++
 +	if (!*device) {
 +		for_each_hdmirx(first_device_cb, &detected);
 +		device = detected ? detected : "";
 +	}
 +	if (s->thread_running && s->device && strcmp(s->device, device) == 0 && s->edid_setting == edid) {
 +		bfree(detected);
++		if (s->audio_enabled) {
++			start_audio(s);
++		} else {
++			stop_audio(s);
++		}
 +		return;
 +	}
 +
@@ -1503,7 +1840,15 @@ index 0000000..3362ac3
 +	bfree(s->device);
 +	s->device = bstrdup(device);
 +	bfree(detected);
-+	start_capture(s);
++	if (!s->disconnected) {
++		start_capture(s);
++	}
++}
++
++static void hdmirx_defaults(obs_data_t *settings)
++{
++	obs_data_set_default_bool(settings, "decode_hdr", true);
++	obs_data_set_default_bool(settings, "audio", true);
 +}
 +
 +static void *hdmirx_create(obs_data_t *settings, obs_source_t *source)
@@ -1517,8 +1862,15 @@ index 0000000..3362ac3
 +	pthread_mutex_init(&s->mutex, NULL);
 +
 +	s->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-+	if (s->wake_fd < 0) {
++	s->audio_wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++	if (s->wake_fd < 0 || s->audio_wake_fd < 0) {
 +		blog_s(s, LOG_ERROR, "eventfd: %s", strerror(errno));
++		if (s->wake_fd >= 0) {
++			close(s->wake_fd);
++		}
++		if (s->audio_wake_fd >= 0) {
++			close(s->audio_wake_fd);
++		}
 +		pthread_mutex_destroy(&s->mutex);
 +		bfree(s);
 +		return NULL;
@@ -1549,8 +1901,10 @@ index 0000000..3362ac3
 +	obs_leave_graphics();
 +
 +	close(s->wake_fd);
++	close(s->audio_wake_fd);
 +	pthread_mutex_destroy(&s->mutex);
 +	dstr_free(&s->last_status);
++	dstr_free(&s->audio_status);
 +	bfree(s->device);
 +	bfree(s);
 +}
@@ -1618,7 +1972,7 @@ index 0000000..3362ac3
 +	gs_effect_set_float(gs_effect_get_param_by_name(s->effect, "maximum_over_sdr_white_nits"),
 +			    10000.0f / obs_get_video_sdr_white_level());
 +
-+	while (gs_effect_loop(s->effect, s->pq ? s->layout.technique_pq : s->layout.technique)) {
++	while (gs_effect_loop(s->effect, s->pq && s->decode_pq ? s->layout.technique_pq : s->layout.technique)) {
 +		gs_draw_sprite(b->tex[0], 0, s->layout.width, s->layout.height);
 +	}
 +}
@@ -1654,7 +2008,7 @@ index 0000000..3362ac3
 +	UNUSED_PARAMETER(preferred_spaces);
 +
 +	pthread_mutex_lock(&s->mutex);
-+	bool pq = s->fd >= 0 && s->pq;
++	bool pq = s->fd >= 0 && s->pq && s->decode_pq;
 +	pthread_mutex_unlock(&s->mutex);
 +	return pq ? GS_CS_709_EXTENDED : GS_CS_SRGB;
 +}
@@ -1697,10 +2051,18 @@ index 0000000..3362ac3
 +	pthread_mutex_lock(&s->mutex);
 +	add_info(props, "edid_current", obs_module_text("ReceiverEdid"), edid_name(s->edid_current),
 +		 OBS_TEXT_INFO_NORMAL);
++	if (s->audio_thread_running) {
++		const char *status = s->audio_status.array ? s->audio_status.array : obs_module_text("Starting");
++		add_info(props, "audio_status", obs_module_text("Audio"), status,
++			 s->audio_status_level == LOG_WARNING ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
++	}
 +	if (s->fd < 0) {
-+		const char *status = s->last_status.array ? s->last_status.array : obs_module_text("Starting");
++		const char *status = s->disconnected        ? obs_module_text("Disconnected")
++				     : s->last_status.array ? s->last_status.array
++							    : obs_module_text("Starting");
 +		add_info(props, "status", obs_module_text("Status"), status,
-+			 s->last_status_level == LOG_WARNING ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
++			 !s->disconnected && s->last_status_level == LOG_WARNING ? OBS_TEXT_INFO_WARNING
++										 : OBS_TEXT_INFO_NORMAL);
 +		pthread_mutex_unlock(&s->mutex);
 +		return;
 +	}
@@ -1755,6 +2117,9 @@ index 0000000..3362ac3
 +		if (s->max_cll) {
 +			dstr_catf(&value, ", MaxCLL %u nits", s->max_cll);
 +		}
++		if (!s->decode_pq) {
++			dstr_catf(&value, ", %s", obs_module_text("HdrPassedThrough"));
++		}
 +	} else {
 +		dstr_printf(&value, "%s (SDR)", obs_module_text("No"));
 +		if (s->edid_current != EDID_HDR && s->edid_current != EDID_CUSTOM) {
@@ -1765,8 +2130,9 @@ index 0000000..3362ac3
 +
 +	/* Frames never pass through the CPU. 8-bit frames go straight to the GPU,
 +	 * which converts them in hdmirx.effect; 10-bit frames pass through RGA3. */
-+	const char *shader = rgb ? (s->pq ? "BGR → RGB, PQ → linear Rec. 709" : "BGR → RGB")
-+				 : (s->pq ? "YCbCr → RGB, PQ → linear Rec. 709" : "YCbCr → RGB");
++	bool decode = s->pq && s->decode_pq;
++	const char *shader = rgb ? (decode ? "BGR → RGB, PQ → linear Rec. 709" : "BGR → RGB")
++				 : (decode ? "YCbCr → RGB, PQ → linear Rec. 709" : "YCbCr → RGB");
 +	if (s->layout.gpu_fourcc) {
 +		char gpu_fourcc[5];
 +		dstr_printf(&value, "%s → %s on RGA3 (%.1f ms/frame), %s GPU shader, no CPU copy", fourcc,
@@ -1801,12 +2167,53 @@ index 0000000..3362ac3
 +	dstr_free(&value);
 +}
 +
++static void reload_properties_task(void *param)
++{
++	obs_weak_source_t *weak = param;
++	obs_source_t *source = obs_weak_source_get_source(weak);
++
++	if (source) {
++		obs_source_update_properties(source);
++		obs_source_release(source);
++	}
++	obs_weak_source_release(weak);
++}
++
++/* A button returning true only redraws the properties it already has, so
++ * request fresh ones instead. Doing that from inside the click would free the
++ * clicked property, and UI tasks queued from the UI thread run immediately, so
++ * signal from the graphics thread; the window then reloads asynchronously. */
++static void reload_properties(struct hdmirx_source *s)
++{
++	obs_queue_task(OBS_TASK_GRAPHICS, reload_properties_task, obs_source_get_weak_source(s->source), false);
++}
++
 +static bool refresh_clicked(obs_properties_t *props, obs_property_t *p, void *data)
 +{
 +	UNUSED_PARAMETER(props);
 +	UNUSED_PARAMETER(p);
-+	UNUSED_PARAMETER(data);
-+	return true; /* reload the properties */
++	reload_properties(data);
++	return false;
++}
++
++/* Stopping the capture thread closes the device, so other programs can use the
++ * receiver until it's connected again. */
++static bool connect_clicked(obs_properties_t *props, obs_property_t *p, void *data)
++{
++	struct hdmirx_source *s = data;
++	UNUSED_PARAMETER(props);
++	UNUSED_PARAMETER(p);
++
++	s->disconnected = !s->disconnected;
++	if (s->disconnected) {
++		stop_capture(s);
++		blog_s(s, LOG_INFO, "Disconnected");
++	} else {
++		blog_s(s, LOG_INFO, "Connecting");
++		start_capture(s);
++	}
++	reload_properties(s);
++	return false;
 +}
 +
 +static obs_properties_t *hdmirx_properties(void *data)
@@ -1829,8 +2236,16 @@ index 0000000..3362ac3
 +	obs_property_list_add_int(list, edid_name(EDID_HDR), EDID_HDR);
 +	obs_property_set_long_description(list, obs_module_text("Edid.Description"));
 +
++	obs_property_t *decode = obs_properties_add_bool(props, "decode_hdr", obs_module_text("DecodeHdr"));
++	obs_property_set_long_description(decode, obs_module_text("DecodeHdr.Description"));
++
++	obs_property_t *audio = obs_properties_add_bool(props, "audio", obs_module_text("CaptureAudio"));
++	obs_property_set_long_description(audio, obs_module_text("CaptureAudio.Description"));
++
 +	if (s) {
 +		add_signal_info(s, props);
++		const char *connect = obs_module_text(s->disconnected ? "Connect" : "Disconnect");
++		obs_properties_add_button2(props, "connect", connect, connect_clicked, s);
 +		obs_properties_add_button2(props, "refresh", obs_module_text("Refresh"), refresh_clicked, s);
 +	}
 +	return props;
@@ -1839,11 +2254,12 @@ index 0000000..3362ac3
 +static struct obs_source_info hdmirx_source_info = {
 +	.id = "rockchip_hdmirx_source",
 +	.type = OBS_SOURCE_TYPE_INPUT,
-+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_DO_NOT_DUPLICATE,
++	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_DO_NOT_DUPLICATE,
 +	.get_name = hdmirx_get_name,
 +	.create = hdmirx_create,
 +	.destroy = hdmirx_destroy,
 +	.update = hdmirx_update,
++	.get_defaults = hdmirx_defaults,
 +	.get_properties = hdmirx_properties,
 +	.video_tick = hdmirx_tick,
 +	.video_render = hdmirx_render,

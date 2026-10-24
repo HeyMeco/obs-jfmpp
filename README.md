@@ -148,7 +148,9 @@ always uses the two RGA3 cores.
   pixel format, colorimetry and range, whether it is HDR, the receiver's EDID, the conversion path (including the RGA3 time per frame
   for 10-bit signals), the GPU textures, and the captured/dropped frame counts. Without a
   signal it shows why, e.g. *No HDMI signal*. It updates by itself when the signal changes;
-  **Refresh** updates the frame and timing counts.
+  **Refresh** updates the frame and timing counts. **Disconnect** stops capturing and
+  closes the receiver's video and audio devices so other programs can use them, until
+  **Connect** (or restarting OBS).
 - The OBS log shows the detected signal, e.g. `Capturing 1920x1080p @ 60.00 Hz, NV24, 8
   buffers`, and a frame count when capture stops.
 - Up to 3840x2160p60. Sources usually send 4K60 as YCbCr 4:2:0 (`NV12`).
@@ -162,6 +164,8 @@ always uses the two RGA3 cores.
   the *HDR Tone Mapping* filter works on it, and HDR canvases get it unchanged. The V4L2 format
   never reports a transfer function, so the source reads PQ from the HDR infoframe through the
   driver's private ioctl, and follows HDR being switched on and off. HLG is shown as SDR.
+  With **Decode HDR** off, the PQ-encoded Rec. 2020 values pass through untouched as an SDR
+  source (washed out), e.g. to tone-map them with a LUT.
 - Sources only send 10-bit and HDR when the receiver's EDID advertises them, and the vendor
   driver's default EDID doesn't. Pick one in the source's **EDID** property:
   - *Leave unchanged* (default) keeps whatever the receiver presents.
@@ -181,8 +185,21 @@ always uses the two RGA3 cores.
 - For 10-bit 2160p60 4:2:2 the receiver reports a quarter of the real pixel clock and frame
   rate. The source measures the frame rate from the buffer timestamps, and Properties show
   the measured values next to the reported ones.
-- Audio comes from the separate HDMI-in ALSA device: add *Audio Input Capture* and pick the
-  `hdmiin` device.
+- The source also records the HDMI audio (**Capture HDMI audio**, on by default), so it
+  shows up in the audio mixer like any other source with audio. The audio comes from the
+  receiver's separate ALSA card (`rockchip,hdmiin`), at the sample rate the HDMI source sends,
+  in stereo. Properties show whether audio is being recorded or why not, e.g. *the HDMI
+  signal carries no audio*.
+- Whenever the HDMI source re-detects the receiver (replug, EDID switch, receiver reset), the
+  vendor kernel marks an open HDMI-in audio stream as disconnected, and it only works again
+  after it was closed and reopened. The source does that by itself. PipeWire doesn't: it
+  retries forever and floods the log with `snd_pcm_status error: File descriptor in bad
+  state` (tens of thousands of lines a minute, enough to fill Armbian's `/var/log`). So the
+  package installs a WirePlumber rule
+  (`/usr/share/wireplumber/wireplumber.conf.d/50-obs-jfmpp-hdmiin.conf`) that keeps PipeWire
+  away from that card. It applies after logging in again or `systemctl --user restart
+  wireplumber`. Don't add the HDMI-in device as *Audio Input Capture*; with the rule in place
+  it isn't offered anymore. While PipeWire still holds the card, Properties say so.
 
 ## Automation
 
