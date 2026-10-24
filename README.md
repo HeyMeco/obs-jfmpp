@@ -72,10 +72,31 @@ encoders only show up when an MPP device node (`/dev/mpp_service`, `/dev/vpu_ser
 `/dev/rkvenc` or `/dev/vepu`) exists. A profile set to an rkmpp encoder falls back to x264 on
 machines without one.
 
-The board needs the Rockchip kernel drivers (`/dev/mpp_service`, `/dev/rga`, `/dev/dri`),
+The board needs the Rockchip kernel drivers (`/dev/mpp_service`, `/dev/rga`, `/dev/dma_heap`),
 as shipped by vendor/BSP kernels such as Armbian's `vendor` branch or
-[ubuntu-rockchip](https://github.com/Joshua-Riek/ubuntu-rockchip). Your user needs access
-to those device nodes (usually the `video` and `render` groups).
+[ubuntu-rockchip](https://github.com/Joshua-Riek/ubuntu-rockchip).
+
+MPP opens `/dev/mpp_service` read-write and allocates frames from `/dev/dma_heap/*`. Vendor
+kernels often restrict both to `root`. The package therefore installs
+`/usr/lib/udev/rules.d/70-obs-jfmpp-rockchip.rules`, which gives these nodes and `/dev/rga`
+to the `video` group and, through `uaccess`, to the user logged in at the desktop. The rule
+is applied on install.
+
+#### Troubleshooting "Failed to init MPP context: -1"
+
+That error means MPP couldn't open a device. Check:
+
+```sh
+ls -l /dev/mpp_service /dev/rga /dev/dma_heap/
+getfacl /dev/mpp_service          # your user should be listed (uaccess)
+journalctl -b -t mpp | tail       # MPP's own reason; OBS also prints it to the terminal
+# Test the encoder outside OBS:
+/usr/lib/obs-jellyfin-ffmpeg/bin/ffmpeg -f lavfi -i testsrc2=size=1920x1080:rate=30 \
+  -t 5 -c:v h264_rkmpp /tmp/rkmpp-test.mp4
+```
+
+If the test works with `sudo` but not as your user, it's a permissions problem. Log out and
+back in after installing, or add yourself to the `video` group (`sudo usermod -aG video $USER`).
 
 ## Automation
 

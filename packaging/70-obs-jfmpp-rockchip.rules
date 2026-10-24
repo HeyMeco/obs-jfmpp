@@ -1,0 +1,8 @@
+# Installed by obs-studio (obs-jfmpp): access to the Rockchip hardware encoder.
+#
+# Rockchip MPP opens its service node read-write and allocates frame buffers from
+# the DMA heaps; RGA does colour conversion. Give these to the "video" group and,
+# via "uaccess", to the user logged in at the local seat (applied by
+# 73-seat-late.rules, so this file must sort before it).
+KERNEL=="mpp_service|vpu_service|vpu-service|hevc-service|rkvenc|vepu|rga", GROUP="video", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="dma_heap", GROUP="video", MODE="0660", TAG+="uaccess"

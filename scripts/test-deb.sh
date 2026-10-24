@@ -45,6 +45,7 @@ ldd "$plugins/obs-ffmpeg.so" | grep -E 'libavcodec|rockchip_mpp|librga' || true
 # Same as Debian's autopkgtest for obs-studio.
 QT_QPA_PLATFORM=offscreen obs --version
 QT_QPA_PLATFORM=offscreen obs --help >/dev/null
+[[ -f /usr/lib/udev/rules.d/70-obs-jfmpp-rockchip.rules ]] || die "udev rule missing"
 [[ -f /usr/share/doc/obs-studio/copyright ]] || die "copyright file missing"
 if grep -q -- '-Werror' /usr/lib/*/pkgconfig/libobs.pc; then die "libobs.pc still has -Werror"; fi
 log "Smoke test passed"

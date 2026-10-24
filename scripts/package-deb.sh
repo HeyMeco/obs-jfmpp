@@ -39,6 +39,11 @@ cef_license="$(ls "$WORK_DIR"/cef/cef_binary_*/LICENSE.txt 2>/dev/null | head -n
 [[ -n "$cef_license" ]] && cp "$cef_license" "$DOC/LICENSE.cef"
 endgroup
 
+group "Rockchip device access (udev)"
+install -Dm644 "$REPO_ROOT/packaging/70-obs-jfmpp-rockchip.rules" \
+  "$STAGE/usr/lib/udev/rules.d/70-obs-jfmpp-rockchip.rules"
+endgroup
+
 mapfile -t elfs < <(find "$STAGE" -type f -exec file -N {} + | awk -F: '/ELF/ {print $1}')
 
 group "Strip binaries"
@@ -85,6 +90,7 @@ endgroup
 group "Build obs-studio $DEB_VERSION"
 installed_size="$(du -sk --exclude=DEBIAN "$STAGE" | cut -f1)"
 mkdir -p "$STAGE/DEBIAN"
+install -m755 "$REPO_ROOT/packaging/postinst" "$REPO_ROOT/packaging/postrm" "$STAGE/DEBIAN/"
 cat > "$STAGE/DEBIAN/control" <<CTRL
 Package: obs-studio
 Version: $DEB_VERSION

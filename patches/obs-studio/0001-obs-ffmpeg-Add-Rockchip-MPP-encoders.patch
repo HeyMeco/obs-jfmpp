@@ -30,25 +30,26 @@ index 7d37eeb..b91df3e 100644
  )
  
 diff --git a/plugins/obs-ffmpeg/data/locale/en-US.ini b/plugins/obs-ffmpeg/data/locale/en-US.ini
-index 2331d1e..ebd4e19 100644
+index 2331d1e..7342c80 100644
 --- a/plugins/obs-ffmpeg/data/locale/en-US.ini
 +++ b/plugins/obs-ffmpeg/data/locale/en-US.ini
-@@ -122,6 +122,9 @@ NVENC.TooManySessions="NVENC Error: Too many concurrent sessions. Try closing ot
+@@ -122,6 +122,10 @@ NVENC.TooManySessions="NVENC Error: Too many concurrent sessions. Try closing ot
  NVENC.CheckDrivers="Try installing the latest <a href=\"https://obsproject.com/go/nvidia-drivers\">NVIDIA driver</a>."
  
  AV1.8bitUnsupportedHdr="OBS does not support 8-bit output of Rec. 2100."
 +RKMPP.H264="Rockchip MPP H.264"
 +RKMPP.HEVC="Rockchip MPP HEVC"
++RKMPP.InitError="Failed to open the %1 encoder (%2).<br><br>Check that your user can read and write /dev/mpp_service, /dev/rga and /dev/dma_heap/*. Rockchip MPP's own error messages are printed to the terminal and to the system log (journalctl -t mpp)."
 +RKMPP.HdrUnsupported="The Rockchip MPP encoders do not support Rec. 2100 (HDR) output."
  
  H264.UnsupportedVideoFormat="Only video formats using 8-bit color are supported."
  H264.UnsupportedColorSpace="Only the Rec. 709 color space is supported."
 diff --git a/plugins/obs-ffmpeg/obs-ffmpeg-rkmpp.c b/plugins/obs-ffmpeg/obs-ffmpeg-rkmpp.c
 new file mode 100644
-index 0000000..0aa37cb
+index 0000000..c7800f9
 --- /dev/null
 +++ b/plugins/obs-ffmpeg/obs-ffmpeg-rkmpp.c
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,322 @@
 +/******************************************************************************
 +    Rockchip MPP (rkmpp) H.264/HEVC encoders via jellyfin-ffmpeg.
 +
@@ -183,6 +184,18 @@ index 0000000..0aa37cb
 +	return true;
 +}
 +
++static void rkmpp_on_init_error(void *data, int ret)
++{
++	struct rkmpp_encoder *enc = data;
++	struct dstr error_message = {0};
++
++	dstr_copy(&error_message, obs_module_text("RKMPP.InitError"));
++	dstr_replace(&error_message, "%1", enc->ffve.enc_name);
++	dstr_replace(&error_message, "%2", av_err2str(ret));
++	obs_encoder_set_last_error(enc->ffve.encoder, error_message.array);
++	dstr_free(&error_message);
++}
++
 +static void rkmpp_destroy(void *data)
 +{
 +	struct rkmpp_encoder *enc = data;
@@ -208,7 +221,7 @@ index 0000000..0aa37cb
 +	struct rkmpp_encoder *enc = bzalloc(sizeof(*enc));
 +	enc->codec = codec;
 +
-+	if (!ffmpeg_video_encoder_init(&enc->ffve, enc, encoder, enc_lib, NULL, enc_name, NULL, NULL))
++	if (!ffmpeg_video_encoder_init(&enc->ffve, enc, encoder, enc_lib, NULL, enc_name, rkmpp_on_init_error, NULL))
 +		goto fail;
 +	if (!rkmpp_update(enc, settings))
 +		goto fail;
@@ -360,14 +373,15 @@ index 0000000..0aa37cb
 +	.get_video_info = rkmpp_video_info,
 +};
 diff --git a/plugins/obs-ffmpeg/obs-ffmpeg.c b/plugins/obs-ffmpeg/obs-ffmpeg.c
-index d7880e5..f6f0355 100644
+index d7880e5..61ddd7a 100644
 --- a/plugins/obs-ffmpeg/obs-ffmpeg.c
 +++ b/plugins/obs-ffmpeg/obs-ffmpeg.c
-@@ -323,6 +323,25 @@ static bool hevc_vaapi_supported(void)
+@@ -323,6 +323,35 @@ static bool hevc_vaapi_supported(void)
  #endif
  #endif
  
 +#ifdef ENABLE_RKMPP
++#include <stdlib.h>
 +#include <unistd.h>
 +
 +extern struct obs_encoder_info h264_rkmpp_encoder_info;
@@ -379,8 +393,17 @@ index d7880e5..f6f0355 100644
 +	static const char *const nodes[] = {"/dev/mpp_service", "/dev/vpu_service", "/dev/rkvenc", "/dev/vepu"};
 +
 +	for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
-+		if (access(nodes[i], F_OK) == 0)
-+			return true;
++		if (access(nodes[i], F_OK) != 0)
++			continue;
++
++		/* MPP opens the node read-write; without that, mpp_init() fails with -1. */
++		if (access(nodes[i], R_OK | W_OK) != 0)
++			blog(LOG_WARNING,
++			     "Rockchip MPP: no read/write access to %s, encoding will fail. "
++			     "Give your user access to it, /dev/rga and /dev/dma_heap/* "
++			     "(e.g. the 'video' group or a udev rule)",
++			     nodes[i]);
++		return true;
 +	}
 +	return false;
 +}
@@ -389,11 +412,14 @@ index d7880e5..f6f0355 100644
  #if defined(_WIN32) && !defined(_M_ARM64)
  extern void amf_load(void);
  extern void amf_unload(void);
-@@ -411,6 +430,16 @@ bool obs_module_load(void)
+@@ -411,6 +440,19 @@ bool obs_module_load(void)
  #endif
  #endif
  
 +#ifdef ENABLE_RKMPP
++	/* MPP logs to syslog only by default; mirror its errors to stderr. */
++	setenv("mpp_syslog_perror", "1", 0);
++
 +	if (rkmpp_device_available()) {
 +		blog(LOG_INFO, "Rockchip MPP device found");
 +		register_encoder_if_available(&h264_rkmpp_encoder_info, "h264_rkmpp");

@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+# Apply the Rockchip MPP/RGA/DMA-heap udev rule to devices that already exist.
+if [ "$1" = configure ] && [ -d /run/udev ] && command -v udevadm >/dev/null 2>&1; then
+	udevadm control --reload-rules || true
+	udevadm trigger --action=change --subsystem-match=dma_heap || true
+	udevadm trigger --action=change \
+		--sysname-match=mpp_service --sysname-match=vpu_service --sysname-match=vpu-service \
+		--sysname-match=hevc-service --sysname-match=rkvenc --sysname-match=vepu \
+		--sysname-match=rga || true
+fi
