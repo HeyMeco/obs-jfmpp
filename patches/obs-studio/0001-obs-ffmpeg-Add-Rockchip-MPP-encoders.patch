@@ -30,10 +30,10 @@ index 7d37eeb..b91df3e 100644
  )
  
 diff --git a/plugins/obs-ffmpeg/data/locale/en-US.ini b/plugins/obs-ffmpeg/data/locale/en-US.ini
-index 2331d1e..7342c80 100644
+index d74426c..aa75591 100644
 --- a/plugins/obs-ffmpeg/data/locale/en-US.ini
 +++ b/plugins/obs-ffmpeg/data/locale/en-US.ini
-@@ -122,6 +122,10 @@ NVENC.TooManySessions="NVENC Error: Too many concurrent sessions. Try closing ot
+@@ -121,6 +121,10 @@ NVENC.TooManySessions="NVENC Error: Too many concurrent sessions. Try closing ot
  NVENC.CheckDrivers="Try installing the latest <a href=\"https://obsproject.com/go/nvidia-drivers\">NVIDIA driver</a>."
  
  AV1.8bitUnsupportedHdr="OBS does not support 8-bit output of Rec. 2100."

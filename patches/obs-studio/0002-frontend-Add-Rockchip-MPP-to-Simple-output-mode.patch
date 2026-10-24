@@ -1,8 +1,8 @@
 diff --git a/frontend/data/locale/en-US.ini b/frontend/data/locale/en-US.ini
-index b5cc638..7a985ca 100644
+index 3046ec3..b12173d 100644
 --- a/frontend/data/locale/en-US.ini
 +++ b/frontend/data/locale/en-US.ini
-@@ -1096,6 +1096,8 @@ Basic.Settings.Output.Simple.Encoder.Hardware.NVENC.AV1="Hardware (NVENC, AV1)"
+@@ -1102,6 +1102,8 @@ Basic.Settings.Output.Simple.Encoder.Hardware.NVENC.AV1="Hardware (NVENC, AV1)"
  Basic.Settings.Output.Simple.Encoder.Hardware.NVENC.HEVC="Hardware (NVENC, HEVC)"
  Basic.Settings.Output.Simple.Encoder.Hardware.Apple.H264="Hardware (Apple, H.264)"
  Basic.Settings.Output.Simple.Encoder.Hardware.Apple.HEVC="Hardware (Apple, HEVC)"
@@ -12,10 +12,10 @@ index b5cc638..7a985ca 100644
  Basic.Settings.Output.Simple.Codec.AAC="AAC"
  Basic.Settings.Output.Simple.Codec.AAC.Default="AAC (Default)"
 diff --git a/frontend/settings/OBSBasicSettings.cpp b/frontend/settings/OBSBasicSettings.cpp
-index cace1de..9c2831f 100644
+index 765bb29..ce2ec49 100644
 --- a/frontend/settings/OBSBasicSettings.cpp
 +++ b/frontend/settings/OBSBasicSettings.cpp
-@@ -3492,6 +3492,9 @@ void OBSBasicSettings::SaveOutputSettings()
+@@ -3487,6 +3487,9 @@ void OBSBasicSettings::SaveOutputSettings()
  		presetType = "AMDPreset";
  	} else if (encoder == SIMPLE_ENCODER_AMD_AV1) {
  		presetType = "AMDAV1Preset";
@@ -25,7 +25,7 @@ index cace1de..9c2831f 100644
  	} else if (encoder == SIMPLE_ENCODER_APPLE_H264
  #ifdef ENABLE_HEVC
  		   || encoder == SIMPLE_ENCODER_APPLE_HEVC
-@@ -4980,6 +4983,12 @@ void OBSBasicSettings::FillSimpleRecordingValues()
+@@ -4932,6 +4935,12 @@ void OBSBasicSettings::FillSimpleRecordingValues()
  	if (EncoderAvailable("av1_texture_amf")) {
  		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.AMD.AV1"), QString(SIMPLE_ENCODER_AMD_AV1));
  	}
@@ -38,7 +38,7 @@ index cace1de..9c2831f 100644
  	if (EncoderAvailable("com.apple.videotoolbox.videoencoder.ave.avc")
  #ifndef __aarch64__
  	    && os_get_emulation_status() == true
-@@ -5091,7 +5100,8 @@ void OBSBasicSettings::SimpleStreamingEncoderChanged()
+@@ -5043,7 +5052,8 @@ void OBSBasicSettings::SimpleStreamingEncoderChanged()
  
  		defaultPreset = "balanced";
  		preset = curAMDPreset;
@@ -49,10 +49,10 @@ index cace1de..9c2831f 100644
  		   || encoder == SIMPLE_ENCODER_APPLE_HEVC
  #endif
 diff --git a/frontend/settings/OBSBasicSettings_Stream.cpp b/frontend/settings/OBSBasicSettings_Stream.cpp
-index 2217ccd..a95d71b 100644
+index 1307e26..12ffd2e 100644
 --- a/frontend/settings/OBSBasicSettings_Stream.cpp
 +++ b/frontend/settings/OBSBasicSettings_Stream.cpp
-@@ -1564,6 +1564,9 @@ static QString get_simple_fallback(const QString &enc)
+@@ -1563,6 +1563,9 @@ static QString get_simple_fallback(const QString &enc)
  	if (enc == SIMPLE_ENCODER_QSV_AV1) {
  		return SIMPLE_ENCODER_QSV;
  	}
@@ -62,7 +62,7 @@ index 2217ccd..a95d71b 100644
  	return SIMPLE_ENCODER_X264;
  }
  
-@@ -1778,6 +1781,12 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
+@@ -1777,6 +1780,12 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
  	if (service_supports_encoder(vcodecs, "av1_texture_amf")) {
  		ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.AMD.AV1"), QString(SIMPLE_ENCODER_AMD_AV1));
  	}
@@ -76,7 +76,7 @@ index 2217ccd..a95d71b 100644
  #ifdef __APPLE__
  	if (service_supports_encoder(vcodecs, "com.apple.videotoolbox.videoencoder.ave.avc")
 diff --git a/frontend/utility/SimpleOutput.cpp b/frontend/utility/SimpleOutput.cpp
-index 718a363..a0f8d3d 100644
+index c52e1ea..6ea9dfc 100644
 --- a/frontend/utility/SimpleOutput.cpp
 +++ b/frontend/utility/SimpleOutput.cpp
 @@ -114,6 +114,10 @@ const char *get_simple_output_encoder(const char *encoder)
@@ -90,7 +90,7 @@ index 718a363..a0f8d3d 100644
  	} else if (strcmp(encoder, SIMPLE_ENCODER_APPLE_H264) == 0) {
  		return "com.apple.videotoolbox.videoencoder.ave.avc";
  #ifdef ENABLE_HEVC
-@@ -531,6 +535,14 @@ void SimpleOutput::UpdateRecordingSettings_amd_cqp(int cqp)
+@@ -534,6 +538,14 @@ void SimpleOutput::UpdateRecordingSettings_amd_cqp(int cqp)
  	obs_encoder_update(videoRecording, settings);
  }
  
@@ -105,7 +105,7 @@ index 718a363..a0f8d3d 100644
  void SimpleOutput::UpdateRecordingSettings()
  {
  	bool ultra_hq = (videoQuality == "HQ");
-@@ -566,6 +578,9 @@ void SimpleOutput::UpdateRecordingSettings()
+@@ -569,6 +581,9 @@ void SimpleOutput::UpdateRecordingSettings()
  	} else if (videoEncoder == SIMPLE_ENCODER_NVENC_AV1) {
  		UpdateRecordingSettings_nvenc_hevc_av1(crf);
  
@@ -128,10 +128,10 @@ index 46d6fc3..26c3b61 100644
  #ifdef ENABLE_HEVC
  	void UpdateRecordingSettings_apple_hevc(int quality);
 diff --git a/frontend/widgets/OBSBasic.hpp b/frontend/widgets/OBSBasic.hpp
-index 4343e16..2366143 100644
+index 571de9f..87bb5e5 100644
 --- a/frontend/widgets/OBSBasic.hpp
 +++ b/frontend/widgets/OBSBasic.hpp
-@@ -84,6 +84,8 @@ enum class ItemPasteType { Invalid, Reference, Duplicate, Both };
+@@ -86,6 +86,8 @@ enum class ItemPasteType { Invalid, Reference, Duplicate, Both };
  #define SIMPLE_ENCODER_AMD_AV1 "amd_av1"
  #define SIMPLE_ENCODER_APPLE_H264 "apple_h264"
  #define SIMPLE_ENCODER_APPLE_HEVC "apple_hevc"
@@ -141,10 +141,10 @@ index 4343e16..2366143 100644
  #define PREVIEW_EDGE_SIZE 10
  
 diff --git a/frontend/widgets/OBSBasic_Profiles.cpp b/frontend/widgets/OBSBasic_Profiles.cpp
-index 836be77..e0b6932 100644
+index f960323..51b3361 100644
 --- a/frontend/widgets/OBSBasic_Profiles.cpp
 +++ b/frontend/widgets/OBSBasic_Profiles.cpp
-@@ -799,6 +799,8 @@ void OBSBasic::CheckForSimpleModeX264Fallback()
+@@ -808,6 +808,8 @@ void OBSBasic::CheckForSimpleModeX264Fallback()
  #endif
  	bool amd_av1_supported = false;
  	bool apple_supported = false;
@@ -153,7 +153,7 @@ index 836be77..e0b6932 100644
  	bool changed = false;
  	size_t idx = 0;
  	const char *id;
-@@ -812,6 +814,10 @@ void OBSBasic::CheckForSimpleModeX264Fallback()
+@@ -821,6 +823,10 @@ void OBSBasic::CheckForSimpleModeX264Fallback()
  			qsv_av1_supported = true;
  		} else if (strcmp(id, "ffmpeg_nvenc") == 0) {
  			nve_supported = true;
@@ -164,7 +164,7 @@ index 836be77..e0b6932 100644
  		}
  #ifdef ENABLE_HEVC
  		else if (strcmp(id, "h265_texture_amf") == 0) {
-@@ -883,6 +889,18 @@ void OBSBasic::CheckForSimpleModeX264Fallback()
+@@ -892,6 +898,18 @@ void OBSBasic::CheckForSimpleModeX264Fallback()
  				name = SIMPLE_ENCODER_X264;
  				return false;
  			}

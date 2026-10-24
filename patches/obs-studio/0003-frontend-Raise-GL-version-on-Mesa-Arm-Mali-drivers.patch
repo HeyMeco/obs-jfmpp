@@ -1,5 +1,5 @@
 diff --git a/frontend/obs-main.cpp b/frontend/obs-main.cpp
-index df0ec63..129643b 100644
+index 9fa5d19..af8c0a1 100644
 --- a/frontend/obs-main.cpp
 +++ b/frontend/obs-main.cpp
 @@ -41,6 +41,14 @@
@@ -17,7 +17,7 @@ index df0ec63..129643b 100644
  #ifdef _WIN32
  #include <shellapi.h>
  #define WIN32_LEAN_AND_MEAN
-@@ -485,6 +493,42 @@ QAccessibleInterface *accessibleFactory(const QString &classname, QObject *objec
+@@ -484,6 +492,42 @@ QAccessibleInterface *accessibleFactory(const QString &classname, QObject *objec
  }
  
  static const char *run_program_init = "run_program_init";
@@ -60,7 +60,7 @@ index df0ec63..129643b 100644
  static int run_program(fstream &logFile, int argc, char *argv[])
  {
  	int ret = -1;
-@@ -618,6 +662,12 @@ static int run_program(fstream &logFile, int argc, char *argv[])
+@@ -617,6 +661,12 @@ static int run_program(fstream &logFile, int argc, char *argv[])
  			create_log_file(logFile);
  		}
  
@@ -73,7 +73,7 @@ index df0ec63..129643b 100644
  		program.checkForUncleanShutdown();
  
  		qInstallMessageHandler([](QtMsgType type, const QMessageLogContext &, const QString &message) {
-@@ -882,6 +932,10 @@ static void set_process_mitigation_policies()
+@@ -881,6 +931,10 @@ static void set_process_mitigation_policies()
  
  int main(int argc, char *argv[])
  {

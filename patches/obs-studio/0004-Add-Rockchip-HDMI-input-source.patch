@@ -1,27 +1,26 @@
 diff --git a/plugins/CMakeLists.txt b/plugins/CMakeLists.txt
-index 1bea2e4..6fa5d75 100644
+index 397b703..2317dc2 100644
 --- a/plugins/CMakeLists.txt
 +++ b/plugins/CMakeLists.txt
-@@ -97,6 +97,7 @@ check_obs_websocket()
+@@ -109,6 +109,7 @@ check_obs_websocket()
  
- add_obs_plugin(obs-x264)
- add_obs_plugin(oss-audio PLATFORMS FREEBSD OPENBSD)
-+add_obs_plugin(rockchip-hdmirx PLATFORMS LINUX)
- add_obs_plugin(rtmp-services)
- add_obs_plugin(sndio PLATFORMS LINUX FREEBSD OPENBSD)
- add_obs_plugin(text-freetype2)
+ add_core_module(obs-x264)
+ add_core_module(oss-audio PLATFORMS FREEBSD OPENBSD)
++add_core_module(rockchip-hdmirx PLATFORMS LINUX)
+ add_core_module(rtmp-services)
+ add_core_module(sndio PLATFORMS LINUX FREEBSD OPENBSD)
+ add_core_module(text-freetype2)
 diff --git a/plugins/rockchip-hdmirx/CMakeLists.txt b/plugins/rockchip-hdmirx/CMakeLists.txt
 new file mode 100644
-index 0000000..f7ce790
+index 0000000..63eb990
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/CMakeLists.txt
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,16 @@
 +cmake_minimum_required(VERSION 3.28...3.30)
 +
 +option(ENABLE_ROCKCHIP_HDMIRX "Build OBS with Rockchip HDMI input support" ON)
 +
 +if(NOT ENABLE_ROCKCHIP_HDMIRX)
-+  target_disable(rockchip-hdmirx)
 +  return()
 +endif()
 +
