@@ -172,12 +172,19 @@ always uses the two RGA3 cores.
   - *SDR, up to 4K60 4:2:0 (340 MHz)* is the driver's default.
   - *SDR, up to 4K60 4:4:4 (600 MHz)*.
   - *HDR10 and 10-bit, up to 4K60 (600 MHz)*.
+  - *SDR, up to 1440p120, 1080p120 and 4K60 (600 MHz)*.
+  - *HDR10 and 10-bit, up to 1440p120, 1080p120 and 4K60 (600 MHz)*.
 
-  These are the driver's own EDIDs, written through V4L2, so no root access is needed. The
+  The first three are the driver's own EDIDs. The two high refresh rate ones are the
+  600 MHz and HDR EDIDs plus 2560x1440 at 120 Hz (preferred) and 60 Hz, 1920x1080 at
+  120 and 100 Hz, and monitor ranges up to 120 Hz and 190 kHz, which the driver's EDIDs
+  cap at 70 Hz and 140 kHz. 1440p120 HDR arrives as 4:2:2: 10-bit 4:4:4 would need
+  622 MHz. All are written through V4L2, so no root access is needed. The
   HDMI source re-detects the receiver as if it was replugged. The choice is re-applied
   whenever capture starts (the driver puts its own EDID back after a system resume), and
-  Properties show the EDID the receiver presents. Neither EDID offers 10-bit 4:2:0, so 10-bit
-  2160p60 arrives as 4:2:2 (`NV20`). The driver's root-only sysfs switch
+  Properties show the EDID the receiver presents. None of the EDIDs offers 10-bit 4:2:0, so
+  10-bit 2160p60 arrives as 4:2:2 (`NV20`). For 120 fps recordings, set OBS's frame rate
+  (Settings → Video) to 120 as well. The driver's root-only sysfs switch
   (`/sys/devices/platform/fdee0000.hdmirx-controller/hdmirx/hdmirx/edid`) keeps presenting the
   HDR EDID after it was set to `5` once, whatever is written later.
 - The receiver has no 10-bit store for 4:4:4 and RGB: when a source sends HDR that way (macOS
