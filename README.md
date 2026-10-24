@@ -48,6 +48,8 @@ Upstream already installs `libobs.so.0` / `libobs-frontend-api.so.0` compatibili
     these drivers at startup, it sets `MESA_GL_VERSION_OVERRIDE=3.3` and
     `MESA_GLSL_VERSION_OVERRIDE=330` itself, so you don't need to export them. Values you set
     yourself take precedence. The OBS log records when this happens.
+  - a **Rockchip HDMI Input** source for the RK3588 HDMI receiver (`rk_hdmirx`), see
+    [below](#capturing-the-rk3588-hdmi-input).
 - A private copy of jellyfin-ffmpeg (shared libraries plus `ffmpeg`/`ffprobe`),
   Rockchip MPP (`librockchip_mpp`) and RGA (`librga`) in `/usr/lib/obs-jellyfin-ffmpeg`.
   OBS finds it through `RUNPATH`; the system FFmpeg is left untouched and nothing
@@ -102,6 +104,39 @@ journalctl -b -t mpp | tail       # MPP's own reason; OBS also prints it to the 
 
 If the test works with `sudo` but not as your user, it's a permissions problem. Log out and
 back in after installing, or add yourself to the `video` group (`sudo usermod -aG video $USER`).
+
+### Capturing the RK3588 HDMI input
+
+Add **Sources → Rockchip HDMI Input**. Don't use *Video Capture Device (V4L2)* for this
+port.
+
+The HDMI receiver only delivers the pixel format the connected device sends, and can't
+convert it. Macs and many PCs send YCbCr 4:4:4 (`NV24`), which the V4L2 source can't use:
+it fails with `Unable to set format` and stays black. Even with a format it accepts, the V4L2
+source copies every frame on the CPU, which is very slow on this receiver.
+
+The Rockchip HDMI Input source never touches the pixels on the CPU. It exports the capture
+buffers as dma-bufs, imports them into the Mali GPU as textures, and converts them to RGB in
+a shader. It accepts `NV24`, `NV16`, `NV12` and `BGR3` (RGB), so the device's colour settings
+don't matter.
+
+- The resolution and frame rate follow the HDMI signal. When the device changes mode or is
+  reconnected, the source restarts by itself; while there is no signal it is empty.
+- The source's Properties window shows the signal: resolution, frame rate, pixel clock,
+  pixel format, colorimetry and range, and the captured/dropped frame counts. Without a
+  signal it shows why, e.g. *No HDMI signal*. It updates by itself when the signal changes;
+  **Refresh** updates the frame counts.
+- The OBS log shows the detected signal, e.g. `Capturing 1920x1080p @ 60.00 Hz, NV24, 8
+  buffers`, and a frame count when capture stops.
+- Up to 3840x2160p60. Sources usually send 4K60 as YCbCr 4:2:0 (`NV12`).
+- The vendor driver only reprograms its DMA for a new pixel encoding on hotplug. When a
+  source switches encoding without replugging (macOS going from 1080p 4:4:4 to 4K 4:2:0,
+  for example), the receiver stops delivering frames. The source then resets the receiver
+  (at most every 30 s), which takes a few seconds; the log shows *Resetting the HDMI
+  receiver*.
+- 10-bit signals (`NV15`/`NV20`) aren't supported yet; the log names the format.
+- Audio comes from the separate HDMI-in ALSA device: add *Audio Input Capture* and pick the
+  `hdmiin` device.
 
 ## Automation
 

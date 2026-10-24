@@ -40,6 +40,8 @@ plugins="$(echo /usr/lib/*/obs-plugins)"
 [[ -f "$plugins/obs-browser.so" && -f "$plugins/libcef.so" ]] || die "browser source (CEF) missing"
 grep -q ffmpeg_rkmpp_h264 "$plugins/obs-ffmpeg.so" || die "obs-ffmpeg lacks the rkmpp encoders"
 grep -q 'Hardware.RKMPP.H264' /usr/share/obs/obs-studio/locale/en-US.ini || die "Simple mode rkmpp strings missing"
+[[ -f "$plugins/rockchip-hdmirx.so" && -f /usr/share/obs/obs-plugins/rockchip-hdmirx/hdmirx.effect ]] \
+  || die "Rockchip HDMI input source missing"
 
 ldd "$plugins/obs-ffmpeg.so" | grep -E 'libavcodec|rockchip_mpp|librga' || true
 # Same as Debian's autopkgtest for obs-studio.
