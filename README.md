@@ -43,6 +43,11 @@ Upstream already installs `libobs.so.0` / `libobs-frontend-api.so.0` compatibili
     output mode (see [`patches/obs-studio`](patches/obs-studio));
   - the **browser source**, using the CEF build OBS pins for that release, downloaded from
     `cdn-fastly.obsproject.com` and checked against OBS's SHA-256.
+  - automatic **OpenGL 3.3 on Mali GPUs**: Mesa's Panthor/Panfrost drivers (RK3588 and other
+    Arm Mali GPUs) don't advertise the GL 3.3 core profile OBS needs. When OBS finds one of
+    these drivers at startup, it sets `MESA_GL_VERSION_OVERRIDE=3.3` and
+    `MESA_GLSL_VERSION_OVERRIDE=330` itself, so you don't need to export them. Values you set
+    yourself take precedence. The OBS log records when this happens.
 - A private copy of jellyfin-ffmpeg (shared libraries plus `ffmpeg`/`ffprobe`),
   Rockchip MPP (`librockchip_mpp`) and RGA (`librga`) in `/usr/lib/obs-jellyfin-ffmpeg`.
   OBS finds it through `RUNPATH`; the system FFmpeg is left untouched and nothing
