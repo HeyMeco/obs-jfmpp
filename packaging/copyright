@@ -34,6 +34,11 @@ Files: usr/lib/*/obs-plugins/libcef.so usr/lib/*/obs-plugins/libEGL.so
        usr/lib/*/obs-plugins/libvulkan.so.1 usr/lib/*/obs-plugins/chrome-sandbox
        usr/lib/*/obs-plugins/*.pak usr/lib/*/obs-plugins/*.bin
        usr/lib/*/obs-plugins/icudtl.dat usr/lib/*/obs-plugins/locales/*
+       usr/lib/*/obs-modules/core/libcef.so usr/lib/*/obs-modules/core/libEGL.so
+       usr/lib/*/obs-modules/core/libGLESv2.so usr/lib/*/obs-modules/core/libvk_swiftshader.so
+       usr/lib/*/obs-modules/core/libvulkan.so.1 usr/lib/*/obs-modules/core/chrome-sandbox
+       usr/lib/*/obs-modules/core/*.pak usr/lib/*/obs-modules/core/*.bin
+       usr/lib/*/obs-modules/core/icudtl.dat usr/lib/*/obs-modules/core/locales/*
 Copyright: 2008-2026 Marshall A. Greenblatt; 2006-2026 The Chromium Authors
 Comment: Chromium Embedded Framework binary distribution from
  https://cdn-fastly.obsproject.com/downloads/. See

@@ -35,13 +35,18 @@ source_url="${GITHUB_REPOSITORY:+https://github.com/$GITHUB_REPOSITORY}"
 : "${source_url:=the obs-jfmpp build repository}"
 sed "s|@SOURCE_URL@|$source_url|" "$REPO_ROOT/packaging/copyright" > "$DOC/copyright"
 cp "$SRC_DIR"/rkmpp/LICENSES/* "$DOC/rockchip-mpp/"
-cef_license="$(ls "$WORK_DIR"/cef/cef_binary_*/LICENSE.txt 2>/dev/null | head -n1)"
-[[ -n "$cef_license" ]] && cp "$cef_license" "$DOC/LICENSE.cef"
+cef_root="$(sed -n 's/^CEF_ROOT_DIR:PATH=//p' "$WORK_DIR/obs/CMakeCache.txt")"
+[[ -f "$cef_root/LICENSE.txt" ]] && cp "$cef_root/LICENSE.txt" "$DOC/LICENSE.cef"
 endgroup
 
 group "Rockchip device access (udev)"
 install -Dm644 "$REPO_ROOT/packaging/70-obs-jfmpp-rockchip.rules" \
   "$STAGE/usr/lib/udev/rules.d/70-obs-jfmpp-rockchip.rules"
+endgroup
+
+group "Keep apt from replacing this build"
+# Not listed as a conffile, so dpkg deletes it on remove, not just on purge.
+install -Dm644 "$REPO_ROOT/packaging/apt-preferences" "$STAGE/etc/apt/preferences.d/obs-jfmpp"
 endgroup
 
 mapfile -t elfs < <(find "$STAGE" -type f -exec file -N {} + | awk -F: '/ELF/ {print $1}')
@@ -60,7 +65,8 @@ for f in "${elfs[@]}"; do
     [[ -n "$(patchelf --print-rpath "$f")" ]] || patchelf --set-rpath '$ORIGIN' "$f"
     continue
   fi
-  if patchelf --print-needed "$f" | grep -qE '^lib(avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample)\.so'; then
+  # rockchip-hdmirx links librga directly for 10-bit HDMI input.
+  if patchelf --print-needed "$f" | grep -qE '^lib(avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample|rga)\.so'; then
     patchelf --add-rpath "$FFMPEG_PREFIX/lib" "$f"
     echo "${f#"$STAGE"}"
   fi

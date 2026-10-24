@@ -12,10 +12,10 @@ index 1bea2e4..6fa5d75 100644
  add_obs_plugin(text-freetype2)
 diff --git a/plugins/rockchip-hdmirx/CMakeLists.txt b/plugins/rockchip-hdmirx/CMakeLists.txt
 new file mode 100644
-index 0000000..f7ce790
+index 0000000..49a2786
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/CMakeLists.txt
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,30 @@
 +cmake_minimum_required(VERSION 3.28...3.30)
 +
 +option(ENABLE_ROCKCHIP_HDMIRX "Build OBS with Rockchip HDMI input support" ON)
@@ -28,20 +28,34 @@ index 0000000..f7ce790
 +add_library(rockchip-hdmirx MODULE)
 +add_library(OBS::rockchip-hdmirx ALIAS rockchip-hdmirx)
 +
-+target_sources(rockchip-hdmirx PRIVATE rockchip-hdmirx.c)
++target_sources(rockchip-hdmirx PRIVATE hdmirx-edid.h rockchip-hdmirx.c)
 +
 +target_link_libraries(rockchip-hdmirx PRIVATE OBS::libobs)
++
++# RGA3 unpacks 10-bit input (NV15/NV20) for the GPU; without librga only 8-bit
++# signals are supported.
++find_package(PkgConfig QUIET)
++if(PKG_CONFIG_FOUND)
++  pkg_check_modules(LIBRGA QUIET IMPORTED_TARGET librga)
++endif()
++if(LIBRGA_FOUND)
++  target_compile_definitions(rockchip-hdmirx PRIVATE HAVE_RGA)
++  target_link_libraries(rockchip-hdmirx PRIVATE PkgConfig::LIBRGA)
++else()
++  message(WARNING "librga not found, Rockchip HDMI input will not support 10-bit signals")
++endif()
 +
 +set_target_properties_obs(rockchip-hdmirx PROPERTIES FOLDER plugins PREFIX "")
 diff --git a/plugins/rockchip-hdmirx/data/hdmirx.effect b/plugins/rockchip-hdmirx/data/hdmirx.effect
 new file mode 100644
-index 0000000..6be2617
+index 0000000..e41bbe4
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/data/hdmirx.effect
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,129 @@
 +// Draws rk_hdmirx capture buffers imported as dma-buf textures.
 +//   NV12/NV16/NV24: image = Y (R8), image1 = CbCr (R8G8, R = Cb)
 +//   BGR3:           image = packed B,G,R bytes as R8 at 3x width
++// The PQ techniques decode HDR10 to linear Rec. 709, 1.0 = SDR white.
 +
 +uniform float4x4 ViewProj;
 +uniform texture2d image;
@@ -51,6 +65,7 @@ index 0000000..6be2617
 +uniform float3 color_range_min = {0.0, 0.0, 0.0};
 +uniform float3 color_range_max = {1.0, 1.0, 1.0};
 +uniform float2 frame_size;
++uniform float maximum_over_sdr_white_nits;
 +
 +sampler_state def_sampler {
 +	Filter   = Linear;
@@ -71,23 +86,64 @@ index 0000000..6be2617
 +	return vert_out;
 +}
 +
-+float4 PSYCbCr(VertInOut vert_in) : TARGET
++// From libobs/data/color.effect.
++float st2084_to_linear_channel(float u)
 +{
-+	float y = image.Sample(def_sampler, vert_in.uv).r;
-+	float2 cbcr = image1.Sample(def_sampler, vert_in.uv).rg;
-+	float3 yuv = clamp(float3(y, cbcr), color_range_min, color_range_max);
-+	return saturate(mul(float4(yuv, 1.0), color_matrix));
++	float c = pow(abs(u), 1. / 78.84375);
++	return pow(abs(max(c - 0.8359375, 0.) / (18.8515625 - 18.6875 * c)), 1. / 0.1593017578);
 +}
 +
-+float4 PSBGR3(VertInOut vert_in) : TARGET
++float3 rec2020_to_rec709(float3 v)
 +{
-+	int2 xy = int2(min(vert_in.uv * frame_size, frame_size - 1.0));
++	float r = dot(v, float3(1.6604910021084345, -0.58764113878854951, -0.072849863319884883));
++	float g = dot(v, float3(-0.12455047452159074, 1.1328998971259603, -0.0083494226043694768));
++	float b = dot(v, float3(-0.018150763354905303, -0.10057889800800739, 1.1187296613629127));
++	return float3(r, g, b);
++}
++
++float3 pq_to_linear_709(float3 pq)
++{
++	float3 hdr2020 = float3(st2084_to_linear_channel(pq.r), st2084_to_linear_channel(pq.g),
++				st2084_to_linear_channel(pq.b)) * maximum_over_sdr_white_nits;
++	return rec2020_to_rec709(hdr2020);
++}
++
++float3 sample_ycbcr(float2 uv)
++{
++	float y = image.Sample(def_sampler, uv).r;
++	float2 cbcr = image1.Sample(def_sampler, uv).rg;
++	float3 yuv = clamp(float3(y, cbcr), color_range_min, color_range_max);
++	return saturate(mul(float4(yuv, 1.0), color_matrix).rgb);
++}
++
++float3 load_bgr3(float2 uv)
++{
++	int2 xy = int2(min(uv * frame_size, frame_size - 1.0));
 +	int x = xy.x * 3;
 +	float b = image.Load(int3(x, xy.y, 0)).r;
 +	float g = image.Load(int3(x + 1, xy.y, 0)).r;
 +	float r = image.Load(int3(x + 2, xy.y, 0)).r;
-+	float3 rgb = (float3(r, g, b) - color_range_min) / (color_range_max - color_range_min);
-+	return float4(saturate(rgb), 1.0);
++	return saturate((float3(r, g, b) - color_range_min) / (color_range_max - color_range_min));
++}
++
++float4 PSYCbCr(VertInOut vert_in) : TARGET
++{
++	return float4(sample_ycbcr(vert_in.uv), 1.0);
++}
++
++float4 PSYCbCrPQ(VertInOut vert_in) : TARGET
++{
++	return float4(pq_to_linear_709(sample_ycbcr(vert_in.uv)), 1.0);
++}
++
++float4 PSBGR3(VertInOut vert_in) : TARGET
++{
++	return float4(load_bgr3(vert_in.uv), 1.0);
++}
++
++float4 PSBGR3PQ(VertInOut vert_in) : TARGET
++{
++	return float4(pq_to_linear_709(load_bgr3(vert_in.uv)), 1.0);
 +}
 +
 +technique YCbCr
@@ -99,6 +155,15 @@ index 0000000..6be2617
 +	}
 +}
 +
++technique YCbCrPQ
++{
++	pass
++	{
++		vertex_shader = VSDefault(vert_in);
++		pixel_shader  = PSYCbCrPQ(vert_in);
++	}
++}
++
 +technique BGR3
 +{
 +	pass
@@ -107,12 +172,21 @@ index 0000000..6be2617
 +		pixel_shader  = PSBGR3(vert_in);
 +	}
 +}
++
++technique BGR3PQ
++{
++	pass
++	{
++		vertex_shader = VSDefault(vert_in);
++		pixel_shader  = PSBGR3PQ(vert_in);
++	}
++}
 diff --git a/plugins/rockchip-hdmirx/data/locale/en-US.ini b/plugins/rockchip-hdmirx/data/locale/en-US.ini
 new file mode 100644
-index 0000000..c362f8b
+index 0000000..26cf608
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/data/locale/en-US.ini
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,36 @@
 +RockchipHdmiRx="Rockchip HDMI Input"
 +Device="Device"
 +NoDevice="No Rockchip HDMI input found"
@@ -134,12 +208,91 @@ index 0000000..c362f8b
 +GpuTextures="GPU textures"
 +ImportFailed="import failed (see the log)"
 +WaitingForFrame="waiting for the first frame"
++HdrStored8Bit="HDR kept at 8 bits (the receiver has no 10-bit store for 4:4:4 and RGB)"
++ReceiverReports="the receiver reports"
++Edid="EDID"
++Edid.Unchanged="Leave unchanged"
++Edid.340M="SDR, up to 4K60 4:2:0 (340 MHz)"
++Edid.600M="SDR, up to 4K60 4:4:4 (600 MHz)"
++Edid.Hdr="HDR10 and 10-bit, up to 4K60 (600 MHz)"
++Edid.Custom="custom"
++Edid.Unknown="unknown"
++Edid.Description="The capabilities the receiver advertises to the HDMI source. Changing it makes the source re-detect the receiver, as if it was replugged. The choice is kept and re-applied whenever capture starts; until the board reboots it also applies to other programs."
++ReceiverEdid="Receiver EDID"
++Hdr="HDR"
++Yes="Yes"
++No="No"
++EdidNoHdr="the receiver's EDID doesn't offer HDR"
+diff --git a/plugins/rockchip-hdmirx/hdmirx-edid.h b/plugins/rockchip-hdmirx/hdmirx-edid.h
+new file mode 100644
+index 0000000..d68f297
+--- /dev/null
++++ b/plugins/rockchip-hdmirx/hdmirx-edid.h
+@@ -0,0 +1,58 @@
++#pragma once
++
++/* EDIDs of the vendor rk_hdmirx driver (drivers/media/platform/rockchip/hdmirx/rk_hdmirx.c),
++ * the same ones its sysfs "edid" attribute selects. */
++
++static const uint8_t edid_340m[256] = {
++	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x49, 0x70, 0x88, 0x35, 0x01, 0x00, 0x00, 0x00, 0x2d, 0x1f,
++	0x01, 0x03, 0x80, 0x78, 0x44, 0x78, 0x0a, 0xcf, 0x74, 0xa3, 0x57, 0x4c, 0xb0, 0x23, 0x09, 0x48, 0x4c, 0x21,
++	0x08, 0x00, 0x61, 0x40, 0x01, 0x01, 0x81, 0x00, 0x95, 0x00, 0xa9, 0xc0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
++	0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c, 0x45, 0x00, 0x20, 0xc2, 0x31, 0x00, 0x00, 0x1e,
++	0x01, 0x1d, 0x00, 0x72, 0x51, 0xd0, 0x1e, 0x20, 0x6e, 0x28, 0x55, 0x00, 0x20, 0xc2, 0x31, 0x00, 0x00, 0x1e,
++	0x00, 0x00, 0x00, 0xfc, 0x00, 0x52, 0x4b, 0x2d, 0x55, 0x48, 0x44, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
++	0x00, 0x00, 0x00, 0xfd, 0x00, 0x3b, 0x46, 0x1f, 0x8c, 0x3c, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
++	0x01, 0xa7, 0x02, 0x03, 0x31, 0xf1, 0x51, 0x07, 0x16, 0x14, 0x05, 0x01, 0x03, 0x12, 0x13, 0x84, 0x22, 0x1f,
++	0x90, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x23, 0x09, 0x07, 0x07, 0x83, 0x01, 0x00, 0x00, 0x67, 0x03, 0x0c, 0x00,
++	0x30, 0x00, 0x00, 0x44, 0xe3, 0x05, 0x03, 0x01, 0xe3, 0x0e, 0x60, 0x61, 0xe2, 0x00, 0xcb, 0x02, 0x3a, 0x80,
++	0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c, 0x45, 0x00, 0x20, 0xc2, 0x31, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x22,
++};
++
++static const uint8_t edid_600m[256] = {
++	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x24, 0xd0, 0x88, 0x35, 0x01, 0x00, 0x00, 0x00, 0x2d, 0x20,
++	0x01, 0x03, 0x80, 0x78, 0x44, 0x78, 0x0a, 0xcf, 0x74, 0xa3, 0x57, 0x4c, 0xb0, 0x23, 0x09, 0x48, 0x4c, 0x21,
++	0x08, 0x00, 0x61, 0x40, 0x01, 0x01, 0x81, 0x00, 0x95, 0x00, 0xa9, 0xc0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
++	0x08, 0xe8, 0x00, 0x30, 0xf2, 0x70, 0x5a, 0x80, 0xb0, 0x58, 0x8a, 0x00, 0xc4, 0x8e, 0x21, 0x00, 0x00, 0x1e,
++	0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c, 0x45, 0x00, 0xb9, 0xa8, 0x42, 0x00, 0x00, 0x1e,
++	0x00, 0x00, 0x00, 0xfc, 0x00, 0x49, 0x46, 0x50, 0x20, 0x44, 0x69, 0x73, 0x70, 0x6c, 0x61, 0x79, 0x0a, 0x20,
++	0x00, 0x00, 0x00, 0xfd, 0x00, 0x3b, 0x46, 0x1f, 0x8c, 0x3c, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
++	0x01, 0xdd, 0x02, 0x03, 0x40, 0xf2, 0x51, 0x07, 0x16, 0x14, 0x05, 0x01, 0x03, 0x12, 0x13, 0x84, 0x22, 0x1f,
++	0x90, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x23, 0x09, 0x07, 0x07, 0x83, 0x01, 0x00, 0x00, 0x6d, 0x03, 0x0c, 0x00,
++	0x10, 0x00, 0x00, 0x44, 0x20, 0x00, 0x60, 0x03, 0x02, 0x01, 0x67, 0xd8, 0x5d, 0xc4, 0x01, 0x78, 0xc0, 0x00,
++	0xe3, 0x05, 0x03, 0x01, 0xe4, 0x0f, 0x00, 0x80, 0x01, 0xe2, 0x00, 0xcb, 0x08, 0xe8, 0x00, 0x30, 0xf2, 0x70,
++	0x5a, 0x80, 0xb0, 0x58, 0x8a, 0x00, 0xc4, 0x8e, 0x21, 0x00, 0x00, 0x1e, 0x02, 0x3a, 0x80, 0x18, 0x71, 0x38,
++	0x2d, 0x40, 0x58, 0x2c, 0x45, 0x00, 0xb9, 0xa8, 0x42, 0x00, 0x00, 0x9e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0xbc,
++};
++
++static const uint8_t edid_hdr[256] = {
++	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x24, 0xd0, 0x88, 0x35, 0x01, 0x00, 0x00, 0x00, 0x2d, 0x20,
++	0x01, 0x03, 0x80, 0x78, 0x44, 0x78, 0x0a, 0xcf, 0x74, 0xa3, 0x57, 0x4c, 0xb0, 0x23, 0x09, 0x48, 0x4c, 0x21,
++	0x08, 0x00, 0x61, 0x40, 0x01, 0x01, 0x81, 0x00, 0x95, 0x00, 0xa9, 0xc0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
++	0x08, 0xe8, 0x00, 0x30, 0xf2, 0x70, 0x5a, 0x80, 0xb0, 0x58, 0x8a, 0x00, 0xc4, 0x8e, 0x21, 0x00, 0x00, 0x1e,
++	0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c, 0x45, 0x00, 0xb9, 0xa8, 0x42, 0x00, 0x00, 0x1e,
++	0x00, 0x00, 0x00, 0xfc, 0x00, 0x49, 0x46, 0x50, 0x20, 0x44, 0x69, 0x73, 0x70, 0x6c, 0x61, 0x79, 0x0a, 0x20,
++	0x00, 0x00, 0x00, 0xfd, 0x00, 0x3b, 0x46, 0x1f, 0x8c, 0x3c, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
++	0x01, 0xdd, 0x02, 0x03, 0x44, 0xf2, 0x51, 0x07, 0x16, 0x14, 0x05, 0x01, 0x03, 0x12, 0x13, 0x84, 0x22, 0x1f,
++	0x90, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x23, 0x09, 0x07, 0x07, 0x83, 0x01, 0x00, 0x00, 0x6d, 0x03, 0x0c, 0x00,
++	0x10, 0x00, 0x18, 0x44, 0x20, 0x00, 0x60, 0x03, 0x02, 0x01, 0x67, 0xd8, 0x5d, 0xc4, 0x01, 0x78, 0xc0, 0x00,
++	0xe3, 0x05, 0xe3, 0x01, 0xe4, 0x0f, 0x00, 0x80, 0x01, 0xe2, 0x00, 0xcb, 0xe3, 0x06, 0x0d, 0x01, 0x08, 0xe8,
++	0x00, 0x30, 0xf2, 0x70, 0x5a, 0x80, 0xb0, 0x58, 0x8a, 0x00, 0xc4, 0x8e, 0x21, 0x00, 0x00, 0x1e, 0x02, 0x3a,
++	0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c, 0x45, 0x00, 0xb9, 0xa8, 0x42, 0x00, 0x00, 0x9e, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0xc9,
++};
 diff --git a/plugins/rockchip-hdmirx/rockchip-hdmirx.c b/plugins/rockchip-hdmirx/rockchip-hdmirx.c
 new file mode 100644
-index 0000000..066d260
+index 0000000..3362ac3
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/rockchip-hdmirx.c
-@@ -0,0 +1,1073 @@
+@@ -0,0 +1,1566 @@
 +/*
 + * Rockchip HDMI input (rk_hdmirx) source.
 + *
@@ -147,6 +300,14 @@ index 0000000..066d260
 + * YCbCr 4:4:4, which the generic V4L2 source cannot use), so frames are never
 + * copied or converted on the CPU: capture buffers are exported as dma-bufs,
 + * imported as GPU textures once per buffer, and converted to RGB in a shader.
++ *
++ * 10-bit signals arrive packed (NV15/NV20, four samples in five bytes), which
++ * the GPU can't sample. RGA3 unpacks them to NV12/NV16 first, from each capture
++ * buffer into a dma-buf of its own, so the GPU path stays the same.
++ *
++ * HDR10 (PQ) signals are decoded to linear Rec. 709 in the shader and reported
++ * to OBS as an extended-range source, so OBS tone-maps them for SDR output and
++ * passes them through to HDR canvases.
 + */
 +
 +#include <obs-module.h>
@@ -159,6 +320,7 @@ index 0000000..066d260
 +#include <errno.h>
 +#include <fcntl.h>
 +#include <inttypes.h>
++#include <math.h>
 +#include <linux/videodev2.h>
 +#include <poll.h>
 +#include <pthread.h>
@@ -166,6 +328,13 @@ index 0000000..066d260
 +#include <sys/eventfd.h>
 +#include <sys/ioctl.h>
 +#include <unistd.h>
++
++#include "hdmirx-edid.h"
++
++#ifdef HAVE_RGA
++#include <linux/dma-heap.h>
++#include <rga/im2d.h>
++#endif
 +
 +OBS_DECLARE_MODULE()
 +OBS_MODULE_USE_DEFAULT_LOCALE("rockchip-hdmirx", "en-US")
@@ -192,8 +361,47 @@ index 0000000..066d260
 +#define RESET_SETTLE_MS 3000
 +#define RESET_INTERVAL_NS (30 * 1000000000ULL)
 +
-+/* From the vendor kernel's uapi/linux/rk_hdmirx_config.h. */
++/* Packed 10-bit formats of the vendor kernel, missing from older headers. */
++#ifndef V4L2_PIX_FMT_NV15
++#define V4L2_PIX_FMT_NV15 v4l2_fourcc('N', 'V', '1', '5')
++#endif
++#ifndef V4L2_PIX_FMT_NV20
++#define V4L2_PIX_FMT_NV20 v4l2_fourcc('N', 'V', '2', '0')
++#endif
++
++/* From the vendor kernel's uapi/linux/rk_hdmirx_config.h. The V4L2 format
++ * never reports a transfer function; HDR shows up only in the DRM infoframe. */
++struct rk_hdr_metadata {
++	uint8_t eotf;
++	uint8_t metadata_type;
++	struct {
++		uint16_t x, y;
++	} display_primaries[3], white_point;
++	uint16_t max_display_mastering_luminance;
++	uint16_t min_display_mastering_luminance;
++	uint16_t max_cll;
++	uint16_t max_fall;
++};
++_Static_assert(sizeof(struct rk_hdr_metadata) == 26, "struct hdr_metadata_infoframe layout");
++
 +#define RK_HDMIRX_CMD_SOFT_RESET _IO('V', BASE_VIDIOC_PRIVATE + 6)
++#define RK_HDMIRX_CMD_GET_COLOR_RANGE _IOR('V', BASE_VIDIOC_PRIVATE + 9, int)
++#define RK_HDMIRX_CMD_GET_COLOR_SPACE _IOR('V', BASE_VIDIOC_PRIVATE + 10, int)
++#define RK_HDMIRX_CMD_GET_HDR_METADATA _IOR('V', BASE_VIDIOC_PRIVATE + 18, struct rk_hdr_metadata)
++#define HDMI_EOTF_SMPTE_ST2084 2
++
++/* EDID presets, numbered like the driver's sysfs "edid" attribute. */
++enum edid_mode {
++	EDID_UNCHANGED = 0,
++	EDID_340M = 1,
++	EDID_600M = 2,
++	EDID_HDR = 5,
++	EDID_CUSTOM = -1, /* something else, e.g. written by another tool */
++};
++
++/* How often the capture thread re-reads the infoframes; sources switch HDR on
++ * and off without changing the timings. */
++#define COLOR_POLL_MS 1000
 +
 +struct gpu_plane {
 +	uint32_t drm_format;
@@ -209,17 +417,30 @@ index 0000000..066d260
 +	uint32_t gpu_planes;
 +	struct gpu_plane plane[2];
 +	const char *technique;
++	const char *technique_pq;
++
++	/* Set when RGA converts the capture buffers before the GPU reads them. */
++	uint32_t gpu_fourcc;
++	uint32_t src_pitch; /* bytes per line of the packed 10-bit capture */
++	size_t gpu_size;    /* size of one converted buffer */
 +};
 +
 +struct hdmirx_buffer {
 +	int dmabuf[VIDEO_MAX_PLANES];
 +	gs_texture_t *tex[2];
 +	int retire_age; /* -1 while queued, displayed or ready */
++
++	int gpu_dmabuf; /* RGA output, -1 when the GPU reads the capture buffer */
++#ifdef HAVE_RGA
++	rga_buffer_handle_t rga_src_handle, rga_dst_handle;
++	rga_buffer_t rga_src, rga_dst;
++#endif
 +};
 +
 +struct hdmirx_source {
 +	obs_source_t *source;
 +	char *device;
++	enum edid_mode edid_setting; /* preset to keep on the receiver */
 +
 +	pthread_t thread;
 +	bool thread_running;
@@ -244,12 +465,17 @@ index 0000000..066d260
 +	float color_range_max[3];
 +	enum video_colorspace colorspace;
 +	enum video_range_type range;
++	bool pq;          /* HDR10: decode PQ to linear Rec. 709 */
++	uint16_t max_cll; /* content light level from the infoframe, 0 if unknown */
 +	uint64_t frames_captured;
 +	uint64_t frames_dropped; /* replaced before video_tick picked them up */
++	double rga_ms;           /* average RGA conversion time per frame */
++	double frame_interval;   /* average seconds between captured frames */
 +
 +	/* Written by the capture thread, read by the properties. */
 +	struct dstr last_status;
 +	int last_status_level;
++	enum edid_mode edid_current; /* EDID the receiver presents, as of the last check */
 +
 +	/* capture thread only */
 +	uint64_t last_reset_ns;
@@ -289,6 +515,10 @@ index 0000000..066d260
 +		return "YCbCr 4:2:0, 8-bit";
 +	case V4L2_PIX_FMT_BGR24:
 +		return "RGB, 8-bit";
++	case V4L2_PIX_FMT_NV20:
++		return "YCbCr 4:2:2, 10-bit";
++	case V4L2_PIX_FMT_NV15:
++		return "YCbCr 4:2:0, 10-bit";
 +	default:
 +		return NULL;
 +	}
@@ -311,6 +541,27 @@ index 0000000..066d260
 +	obs_source_update_properties(s->source);
 +}
 +
++static void make_yuv_layout(struct hdmirx_layout *l, uint32_t fourcc, uint32_t pitch, uint32_t chroma_pitch,
++			    uint32_t chroma_offset, uint32_t chroma_plane)
++{
++	bool full_w = fourcc == V4L2_PIX_FMT_NV24;
++	bool full_h = fourcc != V4L2_PIX_FMT_NV12;
++
++	l->gpu_planes = 2;
++	l->plane[0] = (struct gpu_plane){DRM_FORMAT_R8, GS_R8, l->width, l->height, pitch, 0, 0};
++	l->plane[1] = (struct gpu_plane){
++		.drm_format = DRM_FORMAT_GR88,
++		.gs_format = GS_R8G8,
++		.width = full_w ? l->width : l->width / 2,
++		.height = full_h ? l->height : l->height / 2,
++		.pitch = chroma_pitch,
++		.offset = chroma_offset,
++		.v4l2_plane = chroma_plane,
++	};
++	l->technique = "YCbCr";
++	l->technique_pq = "YCbCrPQ";
++}
++
 +static bool make_layout(const struct v4l2_pix_format_mplane *mp, struct hdmirx_layout *l)
 +{
 +	uint32_t w = mp->width, h = mp->height;
@@ -328,34 +579,74 @@ index 0000000..066d260
 +		l->gpu_planes = 1;
 +		l->plane[0] = (struct gpu_plane){DRM_FORMAT_R8, GS_R8, w * 3, h, pitch0, 0, 0};
 +		l->technique = "BGR3";
++		l->technique_pq = "BGR3PQ";
 +		return true;
 +
 +	case V4L2_PIX_FMT_NV12:
 +	case V4L2_PIX_FMT_NV16:
 +	case V4L2_PIX_FMT_NV24: {
 +		bool full_w = mp->pixelformat == V4L2_PIX_FMT_NV24;
-+		bool full_h = mp->pixelformat != V4L2_PIX_FMT_NV12;
 +		uint32_t chroma_pitch = split ? mp->plane_fmt[1].bytesperline : (full_w ? pitch0 * 2 : pitch0);
 +
-+		l->gpu_planes = 2;
-+		l->plane[0] = (struct gpu_plane){DRM_FORMAT_R8, GS_R8, w, h, pitch0, 0, 0};
-+		l->plane[1] = (struct gpu_plane){
-+			.drm_format = DRM_FORMAT_GR88,
-+			.gs_format = GS_R8G8,
-+			.width = full_w ? w : w / 2,
-+			.height = full_h ? h : h / 2,
-+			.pitch = chroma_pitch,
-+			.offset = split ? 0 : pitch0 * h,
-+			.v4l2_plane = split ? 1 : 0,
-+		};
-+		l->technique = "YCbCr";
++		make_yuv_layout(l, mp->pixelformat, pitch0, chroma_pitch, split ? 0 : pitch0 * h, split ? 1 : 0);
 +		return true;
 +	}
++
++#ifdef HAVE_RGA
++	/* RGA3 needs the packed 10-bit lines 16-byte aligned (the receiver pads
++	 * them to 64) and an even size; it writes NV12/NV16 with 64-byte lines. */
++	case V4L2_PIX_FMT_NV15:
++	case V4L2_PIX_FMT_NV20: {
++		bool is422 = mp->pixelformat == V4L2_PIX_FMT_NV20;
++		uint32_t pitch = (w + 63) & ~63u;
++
++		if (split || pitch0 % 16 || w % 2 || h % 2) {
++			return false;
++		}
++		l->gpu_fourcc = is422 ? V4L2_PIX_FMT_NV16 : V4L2_PIX_FMT_NV12;
++		l->src_pitch = pitch0;
++		l->gpu_size = (size_t)pitch * (is422 ? h * 2 : h * 3 / 2);
++		make_yuv_layout(l, l->gpu_fourcc, pitch, pitch, pitch * h, 0);
++		return true;
++	}
++#endif
 +	}
 +	return false;
 +}
 +
-+static void set_color_params(struct hdmirx_source *s, const struct v4l2_pix_format_mplane *mp)
++/* Reads the capture format and whether the signal is HDR10. G_FMT reports the
++ * colorimetry the driver cached at the last infoframe interrupt, so refresh it
++ * from the AVI infoframe first. */
++static bool read_format(int fd, struct v4l2_format *fmt, bool *pq, uint16_t *max_cll)
++{
++	struct rk_hdr_metadata md = {0};
++	int value;
++
++	xioctl(fd, RK_HDMIRX_CMD_GET_COLOR_SPACE, &value);
++	xioctl(fd, RK_HDMIRX_CMD_GET_COLOR_RANGE, &value);
++
++	memset(fmt, 0, sizeof(*fmt));
++	fmt->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	if (xioctl(fd, VIDIOC_G_FMT, fmt) < 0) {
++		return false;
++	}
++
++	/* Without a DRM infoframe the driver returns whatever was on its stack,
++	 * so only trust PQ together with BT.2020 colorimetry, as HDR10 sends. */
++	*pq = false;
++	*max_cll = 0;
++	if (xioctl(fd, RK_HDMIRX_CMD_GET_HDR_METADATA, &md) == 0 &&
++	    fmt->fmt.pix_mp.colorspace == V4L2_COLORSPACE_BT2020 && md.metadata_type == 0 &&
++	    (md.eotf & 7) == HDMI_EOTF_SMPTE_ST2084) {
++		*pq = true;
++		*max_cll = md.max_cll;
++	}
++	return true;
++}
++
++/* Called with the mutex held. */
++static void set_color_params(struct hdmirx_source *s, const struct v4l2_pix_format_mplane *mp, bool pq,
++			     uint16_t max_cll)
 +{
 +	bool rgb = mp->pixelformat == V4L2_PIX_FMT_BGR24;
 +	enum video_colorspace cs = VIDEO_CS_709;
@@ -365,6 +656,11 @@ index 0000000..066d260
 +	case V4L2_YCBCR_ENC_601:
 +	case V4L2_YCBCR_ENC_XV601:
 +		cs = VIDEO_CS_601;
++		break;
++	/* Selects the BT.2020 matrix; the shader applies the PQ curve itself. */
++	case V4L2_YCBCR_ENC_BT2020:
++	case V4L2_YCBCR_ENC_BT2020_CONST_LUM:
++		cs = VIDEO_CS_2100_PQ;
 +		break;
 +	case V4L2_YCBCR_ENC_DEFAULT:
 +		cs = mp->height < 720 ? VIDEO_CS_601 : VIDEO_CS_709;
@@ -394,6 +690,8 @@ index 0000000..066d260
 +	}
 +	s->colorspace = cs;
 +	s->range = range;
++	s->pq = pq;
++	s->max_cll = max_cll;
 +}
 +
 +static bool queue_buffer(int fd, uint32_t index, uint32_t num_planes)
@@ -408,6 +706,84 @@ index 0000000..066d260
 +	};
 +	return xioctl(fd, VIDIOC_QBUF, &buf) == 0;
 +}
++
++#ifdef HAVE_RGA
++/* --- RGA (10-bit input) ------------------------------------------------- */
++
++static int alloc_dmabuf(size_t size)
++{
++	static const char *heaps[] = {"/dev/dma_heap/system-uncached", "/dev/dma_heap/system"};
++
++	for (size_t i = 0; i < sizeof(heaps) / sizeof(heaps[0]); i++) {
++		struct dma_heap_allocation_data data = {.len = size, .fd_flags = O_RDWR | O_CLOEXEC};
++		int heap = open(heaps[i], O_RDWR | O_CLOEXEC);
++		if (heap < 0) {
++			continue;
++		}
++		int ret = xioctl(heap, DMA_HEAP_IOCTL_ALLOC, &data);
++		close(heap);
++		if (ret == 0) {
++			return (int)data.fd;
++		}
++	}
++	return -1;
++}
++
++static bool rga_ok(IM_STATUS status)
++{
++	return status == IM_STATUS_SUCCESS || status == IM_STATUS_NOERROR;
++}
++
++static bool rga_buffer_setup(const struct hdmirx_layout *l, struct hdmirx_buffer *b, struct dstr *error)
++{
++	bool is422 = l->fourcc == V4L2_PIX_FMT_NV20;
++	int src_format = is422 ? RK_FORMAT_YCbCr_422_SP_10B : RK_FORMAT_YCbCr_420_SP_10B;
++	int dst_format = is422 ? RK_FORMAT_YCbCr_422_SP : RK_FORMAT_YCbCr_420_SP;
++	uint32_t pitch = l->plane[0].pitch;
++	/* For packed 10-bit formats RGA takes the line stride in bytes. */
++	im_handle_param_t src = {l->src_pitch, l->height, src_format};
++	im_handle_param_t dst = {pitch, l->height, dst_format};
++
++	b->gpu_dmabuf = alloc_dmabuf(l->gpu_size);
++	if (b->gpu_dmabuf < 0) {
++		dstr_printf(error, "Unable to allocate buffers for the RGA output: %s", strerror(errno));
++		return false;
++	}
++	b->rga_src_handle = importbuffer_fd(b->dmabuf[0], &src);
++	b->rga_dst_handle = importbuffer_fd(b->gpu_dmabuf, &dst);
++	if (!b->rga_src_handle || !b->rga_dst_handle) {
++		dstr_copy(error, "Unable to import buffers into RGA");
++		return false;
++	}
++	b->rga_src = wrapbuffer_handle_t(b->rga_src_handle, l->width, l->height, l->src_pitch, l->height, src_format);
++	b->rga_dst = wrapbuffer_handle_t(b->rga_dst_handle, l->width, l->height, pitch, l->height, dst_format);
++	return true;
++}
++
++static void rga_buffer_release(struct hdmirx_buffer *b)
++{
++	if (b->rga_src_handle) {
++		releasebuffer_handle(b->rga_src_handle);
++	}
++	if (b->rga_dst_handle) {
++		releasebuffer_handle(b->rga_dst_handle);
++	}
++	b->rga_src_handle = b->rga_dst_handle = 0;
++	if (b->gpu_dmabuf >= 0) {
++		close(b->gpu_dmabuf);
++	}
++	b->gpu_dmabuf = -1;
++}
++
++static IM_STATUS rga_convert(const struct hdmirx_layout *l, struct hdmirx_buffer *b)
++{
++	im_rect rect = {0, 0, (int)l->width, (int)l->height};
++	im_rect none = {0};
++	rga_buffer_t pat = {0};
++
++	return improcess(b->rga_src, b->rga_dst, pat, rect, rect, none, IM_SYNC);
++}
++#endif
 +
 +/* --- capture thread ----------------------------------------------------- */
 +
@@ -434,8 +810,13 @@ index 0000000..066d260
 +			}
 +			b->dmabuf[p] = -1;
 +		}
++#ifdef HAVE_RGA
++		rga_buffer_release(b);
++#endif
 +	}
 +	s->fd = -1;
++	s->rga_ms = 0.0;
++	s->frame_interval = 0.0;
 +	s->num_buffers = 0;
 +	s->ready = s->displayed = -1;
 +	s->import_failed = false;
@@ -501,6 +882,98 @@ index 0000000..066d260
 +	return false;
 +}
 +
++static void wait_ms(struct hdmirx_source *s, int ms)
++{
++	struct pollfd pfd = {.fd = s->wake_fd, .events = POLLIN};
++	if (!s->stop) {
++		poll(&pfd, 1, ms);
++	}
++}
++
++static const uint8_t *edid_data(enum edid_mode mode)
++{
++	switch (mode) {
++	case EDID_340M:
++		return edid_340m;
++	case EDID_600M:
++		return edid_600m;
++	case EDID_HDR:
++		return edid_hdr;
++	default:
++		return NULL;
++	}
++}
++
++static const char *edid_name(enum edid_mode mode)
++{
++	switch (mode) {
++	case EDID_340M:
++		return obs_module_text("Edid.340M");
++	case EDID_600M:
++		return obs_module_text("Edid.600M");
++	case EDID_HDR:
++		return obs_module_text("Edid.Hdr");
++	case EDID_CUSTOM:
++		return obs_module_text("Edid.Custom");
++	default:
++		return obs_module_text("Edid.Unknown");
++	}
++}
++
++static enum edid_mode read_edid(int fd)
++{
++	static const enum edid_mode modes[] = {EDID_340M, EDID_600M, EDID_HDR};
++	uint8_t data[256];
++	struct v4l2_edid edid = {.blocks = 2, .edid = data};
++
++	if (xioctl(fd, VIDIOC_G_EDID, &edid) < 0 || edid.blocks != 2) {
++		return EDID_CUSTOM;
++	}
++	for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
++		if (memcmp(data, edid_data(modes[i]), sizeof(data)) == 0) {
++			return modes[i];
++		}
++	}
++	return EDID_CUSTOM;
++}
++
++/* Makes the receiver present the EDID chosen in the properties. Writing it
++ * replugs the HDMI source, which then re-reads it; this is done through V4L2
++ * rather than the driver's root-only sysfs attribute. Returns true when it was
++ * changed, so the caller waits for the signal to come back. */
++static bool apply_edid(struct hdmirx_source *s, int fd)
++{
++	enum edid_mode current = read_edid(fd);
++	enum edid_mode wanted = s->edid_setting;
++	struct dstr status = {0};
++	bool changed = false;
++
++	if (wanted != EDID_UNCHANGED && wanted != current) {
++		/* V4L2 copies the EDID back to the caller, so it can't be read-only. */
++		uint8_t data[256];
++		struct v4l2_edid edid = {.blocks = 2, .edid = data};
++		memcpy(data, edid_data(wanted), sizeof(data));
++		if (xioctl(fd, VIDIOC_S_EDID, &edid) == 0) {
++			dstr_printf(&status, "Switching the EDID to %s; the HDMI source re-detects the receiver",
++				    edid_name(wanted));
++			current = wanted;
++			changed = true;
++		} else {
++			dstr_printf(&status, "Unable to set the EDID: %s", strerror(errno));
++		}
++	}
++
++	pthread_mutex_lock(&s->mutex);
++	s->edid_current = current;
++	pthread_mutex_unlock(&s->mutex);
++
++	if (status.len) {
++		set_status(s, changed ? LOG_INFO : LOG_WARNING, status.array);
++	}
++	dstr_free(&status);
++	return changed;
++}
++
 +static bool stream_setup(struct hdmirx_source *s)
 +{
 +	struct v4l2_capability cap = {0};
@@ -515,7 +988,7 @@ index 0000000..066d260
 +	struct hdmirx_buffer buffers[MAX_BUFFERS];
 +	struct hdmirx_layout layout;
 +	struct dstr status = {0};
-+	char fourcc[5];
++	char fourcc[5], fourcc2[5];
 +	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 +	int fd;
 +
@@ -540,6 +1013,12 @@ index 0000000..066d260
 +
 +	xioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
 +
++	if (apply_edid(s, fd)) {
++		close(fd);
++		wait_ms(s, RESET_SETTLE_MS);
++		return false;
++	}
++
 +	if (!query_signal(s, fd, &timings)) {
 +		goto fail;
 +	}
@@ -548,8 +1027,10 @@ index 0000000..066d260
 +	 * rejects measured timings that are slightly off the CEA-861 table, so only
 +	 * a capture format that doesn't match the signal is an error. */
 +	int set_err = set_timings(fd, &timings) ? 0 : errno;
++	bool pq;
++	uint16_t max_cll;
 +
-+	if (xioctl(fd, VIDIOC_G_FMT, &fmt) < 0) {
++	if (!read_format(fd, &fmt, &pq, &max_cll)) {
 +		set_status(s, LOG_WARNING, "Unable to read capture format");
 +		goto fail;
 +	}
@@ -582,6 +1063,7 @@ index 0000000..066d260
 +	memset(buffers, 0, sizeof(buffers));
 +	for (uint32_t i = 0; i < MAX_BUFFERS; i++) {
 +		buffers[i].retire_age = -1;
++		buffers[i].gpu_dmabuf = -1;
 +		for (int p = 0; p < VIDEO_MAX_PLANES; p++) {
 +			buffers[i].dmabuf[p] = -1;
 +		}
@@ -607,6 +1089,29 @@ index 0000000..066d260
 +		}
 +	}
 +
++#ifdef HAVE_RGA
++	if (layout.gpu_fourcc) {
++		/* RGA2 can't read packed 10-bit and only reaches the first 4 GB of RAM. */
++		imconfig(IM_CONFIG_SCHEDULER_CORE, IM_SCHEDULER_RGA3_CORE0 | IM_SCHEDULER_RGA3_CORE1);
++		for (uint32_t i = 0; i < req.count; i++) {
++			if (!rga_buffer_setup(&layout, &buffers[i], &status)) {
++				set_status(s, LOG_WARNING, status.array);
++				goto fail_buffers;
++			}
++		}
++		im_rect rect = {0, 0, (int)layout.width, (int)layout.height};
++		im_rect none = {0};
++		rga_buffer_t pat = {0};
++		IM_STATUS check = imcheck_t(buffers[0].rga_src, buffers[0].rga_dst, pat, rect, rect, none, 0);
++		if (!rga_ok(check)) {
++			dstr_printf(&status, "RGA can't convert %s to %s: %s", fourcc_name(layout.fourcc, fourcc),
++				    fourcc_name(layout.gpu_fourcc, fourcc2), imStrError_t(check));
++			set_status(s, LOG_WARNING, status.array);
++			goto fail_buffers;
++		}
++	}
++#endif
++
 +	if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
 +		dstr_printf(&status, "Unable to start streaming: %s", strerror(errno));
 +		set_status(s, LOG_WARNING, status.array);
@@ -621,13 +1126,19 @@ index 0000000..066d260
 +	s->num_buffers = req.count;
 +	s->ready = s->displayed = -1;
 +	s->import_failed = false;
-+	set_color_params(s, &fmt.fmt.pix_mp);
++	set_color_params(s, &fmt.fmt.pix_mp, pq, max_cll);
 +	pthread_mutex_unlock(&s->mutex);
 +
 +	{
 +		const struct v4l2_bt_timings *bt = &timings.bt;
 +		dstr_printf(&status, "Capturing %ux%u%s @ %.2f Hz, %s, %u buffers", layout.width, layout.height,
 +			    bt->interlaced ? "i" : "p", timings_fps(bt), fourcc_name(layout.fourcc, fourcc), req.count);
++		if (layout.gpu_fourcc) {
++			dstr_catf(&status, ", converted to %s on RGA3", fourcc_name(layout.gpu_fourcc, fourcc2));
++		}
++		if (pq) {
++			dstr_cat(&status, ", HDR10 (PQ)");
++		}
 +		set_status(s, LOG_INFO, status.array);
 +	}
 +	dstr_free(&status);
@@ -640,6 +1151,9 @@ index 0000000..066d260
 +				close(buffers[i].dmabuf[p]);
 +			}
 +		}
++#ifdef HAVE_RGA
++		rga_buffer_release(&buffers[i]);
++#endif
 +	}
 +fail:
 +	dstr_free(&status);
@@ -668,14 +1182,54 @@ index 0000000..066d260
 +	return false;
 +}
 +
++/* Applies colorimetry or HDR changes that keep the timings and the pixel
++ * format. Returns false when the stream has to restart. */
++static bool update_color(struct hdmirx_source *s, int fd)
++{
++	struct v4l2_format fmt;
++	bool pq, changed;
++	uint16_t max_cll;
++
++	if (!read_format(fd, &fmt, &pq, &max_cll)) {
++		return true;
++	}
++	if (fmt.fmt.pix_mp.pixelformat != s->layout.fourcc) {
++		return false;
++	}
++
++	pthread_mutex_lock(&s->mutex);
++	enum video_colorspace cs = s->colorspace;
++	enum video_range_type range = s->range;
++	bool was_pq = s->pq;
++	set_color_params(s, &fmt.fmt.pix_mp, pq, max_cll);
++	changed = cs != s->colorspace || range != s->range || was_pq != s->pq;
++	pthread_mutex_unlock(&s->mutex);
++
++	if (changed) {
++		set_status(s, LOG_INFO, pq ? "HDMI signal switched to HDR10 (PQ)" : "HDMI signal colorimetry changed");
++	}
++	return true;
++}
++
 +/* Returns true when the receiver has a signal but stopped delivering frames. */
 +static bool stream_run(struct hdmirx_source *s)
 +{
 +	int fd = s->fd;
 +	uint32_t num_planes = s->layout.v4l2_planes;
 +	int idle_ms = 0;
++	uint64_t color_checked_ns = os_gettime_ns();
++	double last_timestamp = 0.0;
 +
 +	while (!s->stop) {
++		uint64_t now = os_gettime_ns();
++		if (now - color_checked_ns >= COLOR_POLL_MS * 1000000ULL) {
++			color_checked_ns = now;
++			if (!update_color(s, fd)) {
++				set_status(s, LOG_INFO, "HDMI signal changed, restarting");
++				return false;
++			}
++		}
++
 +		struct pollfd pfd[2] = {
 +			{.fd = fd, .events = POLLIN | POLLPRI},
 +			{.fd = s->wake_fd, .events = POLLIN},
@@ -733,7 +1287,36 @@ index 0000000..066d260
 +			}
 +			idle_ms = 0;
 +
++			double rga_ms = 0.0;
++#ifdef HAVE_RGA
++			if (s->layout.gpu_fourcc && !(buf.flags & V4L2_BUF_FLAG_ERROR)) {
++				uint64_t start = os_gettime_ns();
++				IM_STATUS st = rga_convert(&s->layout, &s->buffers[buf.index]);
++				rga_ms = (double)(os_gettime_ns() - start) / 1e6;
++				if (!rga_ok(st)) {
++					struct dstr status = {0};
++					dstr_printf(&status, "RGA conversion failed: %s", imStrError_t(st));
++					set_status(s, LOG_WARNING, status.array);
++					dstr_free(&status);
++					buf.flags |= V4L2_BUF_FLAG_ERROR;
++				}
++			}
++#endif
++
++			/* The receiver's pixel clock (and so the timings' frame rate) is
++			 * off for some modes, e.g. a quarter for 2160p60 10-bit 4:2:2. */
++			double timestamp = (double)buf.timestamp.tv_sec + (double)buf.timestamp.tv_usec / 1e6;
++			double interval = last_timestamp > 0.0 ? timestamp - last_timestamp : 0.0;
++			last_timestamp = timestamp;
++
 +			pthread_mutex_lock(&s->mutex);
++			if (rga_ms > 0.0) {
++				s->rga_ms = s->rga_ms > 0.0 ? s->rga_ms * 0.95 + rga_ms * 0.05 : rga_ms;
++			}
++			if (interval > 0.0 && interval < 1.0) {
++				s->frame_interval = s->frame_interval > 0.0 ? s->frame_interval * 0.95 + interval * 0.05
++									    : interval;
++			}
 +			if (buf.flags & V4L2_BUF_FLAG_ERROR) {
 +				queue_buffer(fd, buf.index, num_planes);
 +			} else {
@@ -749,14 +1332,6 @@ index 0000000..066d260
 +		}
 +	}
 +	return false;
-+}
-+
-+static void wait_ms(struct hdmirx_source *s, int ms)
-+{
-+	struct pollfd pfd = {.fd = s->wake_fd, .events = POLLIN};
-+	if (!s->stop) {
-+		poll(&pfd, 1, ms);
-+	}
 +}
 +
 +/* The vendor driver only reprograms the DMA storage format on hotplug. When the
@@ -912,18 +1487,20 @@ index 0000000..066d260
 +{
 +	struct hdmirx_source *s = data;
 +	const char *device = obs_data_get_string(settings, "device");
++	enum edid_mode edid = (enum edid_mode)obs_data_get_int(settings, "edid");
 +	char *detected = NULL;
 +
 +	if (!*device) {
 +		for_each_hdmirx(first_device_cb, &detected);
 +		device = detected ? detected : "";
 +	}
-+	if (s->thread_running && s->device && strcmp(s->device, device) == 0) {
++	if (s->thread_running && s->device && strcmp(s->device, device) == 0 && s->edid_setting == edid) {
 +		bfree(detected);
 +		return;
 +	}
 +
 +	stop_capture(s);
++	s->edid_setting = edid;
 +	bfree(s->device);
 +	s->device = bstrdup(device);
 +	bfree(detected);
@@ -1010,7 +1587,7 @@ index 0000000..066d260
 +
 +	for (uint32_t p = 0; p < s->layout.gpu_planes; p++) {
 +		const struct gpu_plane *gp = &s->layout.plane[p];
-+		int fd = b->dmabuf[gp->v4l2_plane];
++		int fd = b->gpu_dmabuf >= 0 ? b->gpu_dmabuf : b->dmabuf[gp->v4l2_plane];
 +
 +		b->tex[p] = gs_texture_create_from_dmabuf(gp->width, gp->height, gp->drm_format, gp->gs_format, 1, &fd,
 +							  &gp->pitch, &gp->offset, &linear);
@@ -1038,8 +1615,11 @@ index 0000000..066d260
 +	gs_effect_set_val(gs_effect_get_param_by_name(s->effect, "color_range_max"), s->color_range_max,
 +			  sizeof(s->color_range_max));
 +	gs_effect_set_vec2(gs_effect_get_param_by_name(s->effect, "frame_size"), &size);
++	/* Linear output where 1.0 is OBS's SDR white, as GS_CS_709_EXTENDED expects. */
++	gs_effect_set_float(gs_effect_get_param_by_name(s->effect, "maximum_over_sdr_white_nits"),
++			    10000.0f / obs_get_video_sdr_white_level());
 +
-+	while (gs_effect_loop(s->effect, s->layout.technique)) {
++	while (gs_effect_loop(s->effect, s->pq ? s->layout.technique_pq : s->layout.technique)) {
 +		gs_draw_sprite(b->tex[0], 0, s->layout.width, s->layout.height);
 +	}
 +}
@@ -1063,6 +1643,21 @@ index 0000000..066d260
 +		}
 +	}
 +	pthread_mutex_unlock(&s->mutex);
++}
++
++/* OBS converts the source from this space to whatever it renders into: it
++ * tone-maps HDR for SDR canvases, and the HDR Tone Mapping filter only acts on
++ * sources that report an HDR space. */
++static enum gs_color_space hdmirx_get_color_space(void *data, size_t count, const enum gs_color_space *preferred_spaces)
++{
++	struct hdmirx_source *s = data;
++	UNUSED_PARAMETER(count);
++	UNUSED_PARAMETER(preferred_spaces);
++
++	pthread_mutex_lock(&s->mutex);
++	bool pq = s->fd >= 0 && s->pq;
++	pthread_mutex_unlock(&s->mutex);
++	return pq ? GS_CS_709_EXTENDED : GS_CS_SRGB;
 +}
 +
 +static uint32_t hdmirx_get_width(void *data)
@@ -1101,6 +1696,8 @@ index 0000000..066d260
 +	char fourcc[5];
 +
 +	pthread_mutex_lock(&s->mutex);
++	add_info(props, "edid_current", obs_module_text("ReceiverEdid"), edid_name(s->edid_current),
++		 OBS_TEXT_INFO_NORMAL);
 +	if (s->fd < 0) {
 +		const char *status = s->last_status.array ? s->last_status.array : obs_module_text("Starting");
 +		add_info(props, "status", obs_module_text("Status"), status,
@@ -1118,26 +1715,66 @@ index 0000000..066d260
 +	dstr_printf(&value, "%ux%u%s", s->layout.width, s->layout.height, bt->interlaced ? "i" : "p");
 +	add_info(props, "resolution", obs_module_text("Resolution"), value.array, OBS_TEXT_INFO_NORMAL);
 +
-+	dstr_printf(&value, "%.2f Hz", timings_fps(bt));
-+	add_info(props, "fps", obs_module_text("FrameRate"), value.array, OBS_TEXT_INFO_NORMAL);
-+
-+	dstr_printf(&value, "%.2f MHz", (double)bt->pixelclock / 1e6);
++	/* Prefer the measured frame rate when the receiver's timings disagree. */
++	double fps = timings_fps(bt);
++	double measured = s->frame_interval > 0.0 ? 1.0 / s->frame_interval : 0.0;
++	bool mismatch = measured > 0.0 && fabs(measured - fps) > fps * 0.05;
++	if (mismatch) {
++		uint64_t total = (uint64_t)V4L2_DV_BT_FRAME_WIDTH(bt) * V4L2_DV_BT_FRAME_HEIGHT(bt);
++		dstr_printf(&value, "%.2f Hz (%s %.2f Hz)", measured, obs_module_text("ReceiverReports"), fps);
++		add_info(props, "fps", obs_module_text("FrameRate"), value.array, OBS_TEXT_INFO_NORMAL);
++		dstr_printf(&value, "%.2f MHz (%s %.2f MHz)", measured * (double)total / 1e6,
++			    obs_module_text("ReceiverReports"), (double)bt->pixelclock / 1e6);
++	} else {
++		dstr_printf(&value, "%.2f Hz", fps);
++		add_info(props, "fps", obs_module_text("FrameRate"), value.array, OBS_TEXT_INFO_NORMAL);
++		dstr_printf(&value, "%.2f MHz", (double)bt->pixelclock / 1e6);
++	}
 +	add_info(props, "pixelclock", obs_module_text("PixelClock"), value.array, OBS_TEXT_INFO_NORMAL);
 +
 +	dstr_copy(&value, fourcc_name(s->layout.fourcc, fourcc));
 +	if (desc) {
 +		dstr_catf(&value, " (%s)", desc);
 +	}
-+	add_info(props, "format", obs_module_text("PixelFormat"), value.array, OBS_TEXT_INFO_NORMAL);
++	/* The receiver has no 10-bit store for 4:4:4 and RGB. */
++	enum obs_text_info_type format_type = OBS_TEXT_INFO_NORMAL;
++	if (s->pq && (rgb || s->layout.fourcc == V4L2_PIX_FMT_NV24)) {
++		dstr_catf(&value, ", %s", obs_module_text("HdrStored8Bit"));
++		format_type = OBS_TEXT_INFO_WARNING;
++	}
++	add_info(props, "format", obs_module_text("PixelFormat"), value.array, format_type);
 +
-+	const char *matrix = s->colorspace == VIDEO_CS_601 ? "Rec. 601" : "Rec. 709";
-+	dstr_printf(&value, "%s, %s", rgb ? "RGB" : matrix,
++	const char *matrix = s->colorspace == VIDEO_CS_601       ? "Rec. 601"
++			     : s->colorspace == VIDEO_CS_2100_PQ ? "Rec. 2020"
++								 : "Rec. 709";
++	dstr_printf(&value, "%s, %s", rgb ? (s->pq ? "RGB, Rec. 2020" : "RGB") : matrix,
 +		    obs_module_text(s->range == VIDEO_RANGE_FULL ? "FullRange" : "LimitedRange"));
 +	add_info(props, "color", obs_module_text("Color"), value.array, OBS_TEXT_INFO_NORMAL);
 +
-+	/* Frames never pass through the CPU or RGA: the GPU samples the capture
-+	 * buffers directly and converts them in hdmirx.effect. */
-+	dstr_printf(&value, "%s, GPU shader, zero-copy (no CPU copy, no RGA)", rgb ? "BGR → RGB" : "YCbCr → RGB");
++	if (s->pq) {
++		dstr_printf(&value, "%s, HDR10 (PQ)", obs_module_text("Yes"));
++		if (s->max_cll) {
++			dstr_catf(&value, ", MaxCLL %u nits", s->max_cll);
++		}
++	} else {
++		dstr_printf(&value, "%s (SDR)", obs_module_text("No"));
++		if (s->edid_current != EDID_HDR && s->edid_current != EDID_CUSTOM) {
++			dstr_catf(&value, ", %s", obs_module_text("EdidNoHdr"));
++		}
++	}
++	add_info(props, "hdr", obs_module_text("Hdr"), value.array, OBS_TEXT_INFO_NORMAL);
++
++	/* Frames never pass through the CPU. 8-bit frames go straight to the GPU,
++	 * which converts them in hdmirx.effect; 10-bit frames pass through RGA3. */
++	const char *shader = rgb ? (s->pq ? "BGR → RGB, PQ → linear Rec. 709" : "BGR → RGB")
++				 : (s->pq ? "YCbCr → RGB, PQ → linear Rec. 709" : "YCbCr → RGB");
++	if (s->layout.gpu_fourcc) {
++		char gpu_fourcc[5];
++		dstr_printf(&value, "%s → %s on RGA3 (%.1f ms/frame), %s GPU shader, no CPU copy", fourcc,
++			    fourcc_name(s->layout.gpu_fourcc, gpu_fourcc), s->rga_ms, shader);
++	} else {
++		dstr_printf(&value, "%s, GPU shader, zero-copy (no CPU copy, no RGA)", shader);
++	}
 +	add_info(props, "conversion", obs_module_text("Conversion"), value.array, OBS_TEXT_INFO_NORMAL);
 +
 +	dstr_free(&value);
@@ -1185,6 +1822,14 @@ index 0000000..066d260
 +		obs_property_list_add_string(list, obs_module_text("NoDevice"), "");
 +	}
 +
++	list = obs_properties_add_list(props, "edid", obs_module_text("Edid"), OBS_COMBO_TYPE_LIST,
++				       OBS_COMBO_FORMAT_INT);
++	obs_property_list_add_int(list, obs_module_text("Edid.Unchanged"), EDID_UNCHANGED);
++	obs_property_list_add_int(list, edid_name(EDID_340M), EDID_340M);
++	obs_property_list_add_int(list, edid_name(EDID_600M), EDID_600M);
++	obs_property_list_add_int(list, edid_name(EDID_HDR), EDID_HDR);
++	obs_property_set_long_description(list, obs_module_text("Edid.Description"));
++
 +	if (s) {
 +		add_signal_info(s, props);
 +		obs_properties_add_button2(props, "refresh", obs_module_text("Refresh"), refresh_clicked, s);
@@ -1203,6 +1848,7 @@ index 0000000..066d260
 +	.get_properties = hdmirx_properties,
 +	.video_tick = hdmirx_tick,
 +	.video_render = hdmirx_render,
++	.video_get_color_space = hdmirx_get_color_space,
 +	.get_width = hdmirx_get_width,
 +	.get_height = hdmirx_get_height,
 +	.icon_type = OBS_ICON_TYPE_CAMERA,

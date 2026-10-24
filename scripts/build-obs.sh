@@ -65,6 +65,15 @@ log "Using $cef_name"
 endgroup
 
 group "Build OBS Studio $OBS_VERSION"
+# CMake caches the paths it found (CEF's library and headers among them), so a build
+# directory configured for another OBS release or CEF build has to start over.
+build_id="$OBS_VERSION $cef_name"
+if [[ -d "$WORK_DIR/obs" && "$(cat "$WORK_DIR/obs/.build-id" 2>/dev/null)" != "$build_id" ]]; then
+  log "Starting a clean build directory for $build_id"
+  rm -rf "$WORK_DIR/obs"
+fi
+mkdir -p "$WORK_DIR/obs"
+echo "$build_id" > "$WORK_DIR/obs/.build-id"
 export PKG_CONFIG_PATH="$FFMPEG_PREFIX/lib/pkgconfig"
 cmake -S "$SRC_DIR/obs-studio" -B "$WORK_DIR/obs" -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -88,6 +97,8 @@ cmake -S "$SRC_DIR/obs-studio" -B "$WORK_DIR/obs" -G Ninja \
 # Make sure OBS really picked up jellyfin-ffmpeg and not something else.
 grep -E '^FFmpeg_avcodec_INCLUDE_DIR' "$WORK_DIR/obs/CMakeCache.txt" | grep -q "$FFMPEG_PREFIX" \
   || die "OBS did not find jellyfin-ffmpeg in $FFMPEG_PREFIX"
+grep -E '^CEF_LIBRARY_RELEASE' "$WORK_DIR/obs/CMakeCache.txt" | grep -q "$CEF_DIR/" \
+  || die "OBS did not pick up $cef_name"
 
 cmake --build "$WORK_DIR/obs" -j "$JOBS"
 endgroup

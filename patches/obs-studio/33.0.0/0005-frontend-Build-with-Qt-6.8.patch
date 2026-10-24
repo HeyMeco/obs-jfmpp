@@ -1,0 +1,59 @@
+diff --git a/frontend/cmake/os-linux.cmake b/frontend/cmake/os-linux.cmake
+index b644ea0..d146e72 100644
+--- a/frontend/cmake/os-linux.cmake
++++ b/frontend/cmake/os-linux.cmake
+@@ -12,6 +12,10 @@ target_compile_definitions(
+ )
+ target_link_libraries(obs-studio PRIVATE Qt::DBus)
+ 
++if(Qt6_VERSION AND Qt6_VERSION VERSION_LESS "6.9.0")
++  target_link_libraries(obs-studio PRIVATE Qt::GuiPrivate)
++endif()
++
+ find_package(Libpci REQUIRED)
+ target_link_libraries(obs-studio PRIVATE Libpci::pci)
+ 
+diff --git a/frontend/plugin-manager/InstalledPluginRow.cpp b/frontend/plugin-manager/InstalledPluginRow.cpp
+index e3c1060..4ccf087 100644
+--- a/frontend/plugin-manager/InstalledPluginRow.cpp
++++ b/frontend/plugin-manager/InstalledPluginRow.cpp
+@@ -107,8 +107,10 @@ InstalledPluginRow::InstalledPluginRow(QWidget *parent, const PluginManagerWindo
+ 			//warningIcon->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Maximum);
+ 			//warningIcon->setPixmap(getWarningIcon().pixmap(16, 16));
+ 
++			// Qt before 6.9 has no QString::arg(std::string_view).
++			auto legacyLink = QString::fromUtf8(kLegacyPluginInfoLink.data(), kLegacyPluginInfoLink.size());
+ 			auto legacyInfo =
+-				new QLabel{QTStr("PluginManager.Status.Legacy.Description").arg(kLegacyPluginInfoLink),
++				new QLabel{QTStr("PluginManager.Status.Legacy.Description").arg(legacyLink),
+ 					   moduleText};
+ 			legacyInfo->setTextInteractionFlags(Qt::LinksAccessibleByMouse);
+ 			legacyInfo->setOpenExternalLinks(true);
+diff --git a/frontend/widgets/OBSQTDisplay.cpp b/frontend/widgets/OBSQTDisplay.cpp
+index ab00b96..078fca6 100644
+--- a/frontend/widgets/OBSQTDisplay.cpp
++++ b/frontend/widgets/OBSQTDisplay.cpp
+@@ -10,6 +10,9 @@
+ #include <QWindow>
+ #ifdef ENABLE_WAYLAND
+ #include <QApplication>
++#if QT_VERSION < QT_VERSION_CHECK(6, 9, 0)
++#include <qpa/qplatformnativeinterface.h>
++#endif
+ #endif
+ 
+ #ifdef _WIN32
+@@ -49,7 +52,13 @@ static bool QTToGSWindow(QWindow *window, gs_window &gswindow)
+ 		break;
+ #ifdef ENABLE_WAYLAND
+ 	case OBS_NIX_PLATFORM_WAYLAND: {
++#if QT_VERSION < QT_VERSION_CHECK(6, 9, 0)
++		// Before Qt 6.9, winId() is not the wl_surface on Wayland.
++		QPlatformNativeInterface *native = QGuiApplication::platformNativeInterface();
++		gswindow.display = native->nativeResourceForWindow("surface", window);
++#else
+ 		gswindow.display = (void *)window->winId();
++#endif
+ 		success = gswindow.display != nullptr;
+ 		break;
+ 	}

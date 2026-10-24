@@ -22,6 +22,14 @@ done
 FFLIBS='lib(avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample|postproc)\.so'
 
 # Every OBS binary that links FFmpeg must resolve it to the private copy.
+# OBS 33 moved the modules from obs-plugins to obs-modules/core.
+plugins="$(echo /usr/lib/*/obs-modules/core)"
+plugin_data=/usr/share/obs/obs-modules/core
+if [[ ! -d "$plugins" ]]; then
+  plugins="$(echo /usr/lib/*/obs-plugins)"
+  plugin_data=/usr/share/obs/obs-plugins
+fi
+
 bad=0
 while read -r f; do
   deps="$(ldd "$f")"
@@ -33,15 +41,16 @@ while read -r f; do
     echo "$f has unresolved libraries:"; ldd "$f" | grep 'not found'
     bad=1
   fi
-done < <(find /usr/bin/obs /usr/lib/*/libobs*.so* /usr/lib/*/obs-plugins "$FFMPEG_PREFIX" -type f -name '*.so*' -o -type f -perm -u+x)
+done < <(find /usr/bin/obs /usr/lib/*/libobs*.so* "$plugins" "$FFMPEG_PREFIX" -type f -name '*.so*' -o -type f -perm -u+x)
 [[ $bad -eq 0 ]] || die "library resolution check failed"
 
-plugins="$(echo /usr/lib/*/obs-plugins)"
 [[ -f "$plugins/obs-browser.so" && -f "$plugins/libcef.so" ]] || die "browser source (CEF) missing"
 grep -q ffmpeg_rkmpp_h264 "$plugins/obs-ffmpeg.so" || die "obs-ffmpeg lacks the rkmpp encoders"
 grep -q 'Hardware.RKMPP.H264' /usr/share/obs/obs-studio/locale/en-US.ini || die "Simple mode rkmpp strings missing"
-[[ -f "$plugins/rockchip-hdmirx.so" && -f /usr/share/obs/obs-plugins/rockchip-hdmirx/hdmirx.effect ]] \
+[[ -f "$plugins/rockchip-hdmirx.so" && -f "$plugin_data/rockchip-hdmirx/hdmirx.effect" ]] \
   || die "Rockchip HDMI input source missing"
+ldd "$plugins/rockchip-hdmirx.so" | grep -q "$FFMPEG_PREFIX/lib/librga" \
+  || die "Rockchip HDMI input source isn't linked to the bundled librga (no 10-bit support)"
 
 ldd "$plugins/obs-ffmpeg.so" | grep -E 'libavcodec|rockchip_mpp|librga' || true
 # Same as Debian's autopkgtest for obs-studio.
@@ -50,4 +59,9 @@ QT_QPA_PLATFORM=offscreen obs --help >/dev/null
 [[ -f /usr/lib/udev/rules.d/70-obs-jfmpp-rockchip.rules ]] || die "udev rule missing"
 [[ -f /usr/share/doc/obs-studio/copyright ]] || die "copyright file missing"
 if grep -q -- '-Werror' /usr/lib/*/pkgconfig/libobs.pc; then die "libobs.pc still has -Werror"; fi
+# Not piped straight into grep -q: apt-cache would die of SIGPIPE, failing under pipefail.
+policy="$(apt-cache policy obs-studio)"
+grep -qE '^ \*\*\* .*\+jf.* 1001$' <<<"$policy" || die "apt pin doesn't hold the installed obs-studio"
+apt-get remove -y obs-studio >/dev/null
+[[ ! -e /etc/apt/preferences.d/obs-jfmpp ]] || die "apt pin left behind after remove"
 log "Smoke test passed"

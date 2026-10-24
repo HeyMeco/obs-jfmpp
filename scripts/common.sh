@@ -69,16 +69,25 @@ obs_patch_dir() {
   echo "$dir/$picked"
 }
 
-# Shallow clone of a tag/branch into $SRC_DIR/<name>, reusing an existing checkout.
+# Shallow clone of a tag/branch into $SRC_DIR/<name>, reusing an existing checkout of
+# the same ref and replacing one of another (e.g. after switching OBS_VERSION).
 fetch_git() {
   local name="$1" repo="$2" ref="$3"; shift 3
-  local dest="$SRC_DIR/$name"
+  local dest="$SRC_DIR/$name" current
   if [[ -d "$dest/.git" ]]; then
-    log "Reusing $dest"
-    return
+    current="$(cat "$dest/.git/fetched-ref" 2>/dev/null \
+      || git -C "$dest" describe --tags --exact-match 2>/dev/null \
+      || git -C "$dest" rev-parse --abbrev-ref HEAD)"
+    if [[ "$current" == "$ref" ]]; then
+      log "Reusing $dest"
+      return
+    fi
+    log "Replacing $dest ($current) with $ref"
+    rm -rf "$dest"
   fi
   mkdir -p "$SRC_DIR"
   git clone --depth 1 --branch "$ref" "$@" "$repo" "$dest"
+  echo "$ref" > "$dest/.git/fetched-ref"
 }
 
 deb_arch() { dpkg --print-architecture; }

@@ -4,7 +4,7 @@
 
 OBS Studio `.deb` packages for **arm64 Rockchip boards** (RK3588, RK3568, RK3566, …),
 built against [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) with
-Rockchip MPP/RGA hardware encoding and decoding enabled.
+Rockchip MPP hardware encoding and decoding and RGA 2D acceleration enabled.
 
 | Target | Container image |
 |--------|-----------------|
@@ -89,6 +89,11 @@ kernels often restrict both to `root`. The package therefore installs
 to the `video` group and, through `uaccess`, to the user logged in at the desktop. The rule
 is applied on install.
 
+The package also installs `/etc/apt/preferences.d/obs-jfmpp`, which pins `obs-studio` to
+versions containing `+jf` (priority 1001) so `apt upgrade` doesn't replace it with a newer distribution
+build (without the Rockchip encoders and HDMI input). Newer obs-jfmpp packages still install
+over it, and removing the package removes the pin.
+
 #### Troubleshooting "Failed to init MPP context: -1"
 
 That error means MPP couldn't open a device. Check:
@@ -117,15 +122,33 @@ source copies every frame on the CPU, which is very slow on this receiver.
 
 The Rockchip HDMI Input source never touches the pixels on the CPU. It exports the capture
 buffers as dma-bufs, imports them into the Mali GPU as textures, and converts them to RGB in
-a shader. It accepts `NV24`, `NV16`, `NV12` and `BGR3` (RGB), so the device's colour settings
-don't matter.
+a shader. It accepts every format the receiver delivers, so the device's colour settings don't
+matter:
+
+| Signal | Receiver format | Path to the GPU |
+|--------|-----------------|-----------------|
+| RGB, 8-bit | `BGR3` | GPU directly |
+| YCbCr 4:4:4, 8-bit | `NV24` | GPU directly |
+| YCbCr 4:2:2, 8-bit | `NV16` | GPU directly |
+| YCbCr 4:2:0, 8-bit | `NV12` | GPU directly |
+| YCbCr 4:2:2, 10-bit | `NV20` | RGA3 → `NV16` → GPU |
+| YCbCr 4:2:0, 10-bit | `NV15` | RGA3 → `NV12` → GPU |
+
+The GPU can't sample the receiver's packed 10-bit layout (four samples in five bytes), so the
+RK3588's RGA3 unpacks those frames to 8-bit, from each capture buffer into a dma-buf of its
+own; the GPU then reads that buffer like an 8-bit capture. RGA isn't used for 8-bit signals:
+the GPU reads those capture buffers directly, and an RGA pass would only add a copy. Neither
+RGA on the RK3588 can read YCbCr 4:4:4 (`NV24`) anyway; that needs the RGA2-Pro of newer
+chips. RGA2 can't read packed 10-bit and only addresses the first 4 GB of RAM, so the source
+always uses the two RGA3 cores.
 
 - The resolution and frame rate follow the HDMI signal. When the device changes mode or is
   reconnected, the source restarts by itself; while there is no signal it is empty.
 - The source's Properties window shows the signal: resolution, frame rate, pixel clock,
-  pixel format, colorimetry and range, and the captured/dropped frame counts. Without a
+  pixel format, colorimetry and range, whether it is HDR, the receiver's EDID, the conversion path (including the RGA3 time per frame
+  for 10-bit signals), the GPU textures, and the captured/dropped frame counts. Without a
   signal it shows why, e.g. *No HDMI signal*. It updates by itself when the signal changes;
-  **Refresh** updates the frame counts.
+  **Refresh** updates the frame and timing counts.
 - The OBS log shows the detected signal, e.g. `Capturing 1920x1080p @ 60.00 Hz, NV24, 8
   buffers`, and a frame count when capture stops.
 - Up to 3840x2160p60. Sources usually send 4K60 as YCbCr 4:2:0 (`NV12`).
@@ -134,7 +157,30 @@ don't matter.
   for example), the receiver stops delivering frames. The source then resets the receiver
   (at most every 30 s), which takes a few seconds; the log shows *Resetting the HDMI
   receiver*.
-- 10-bit signals (`NV15`/`NV20`) aren't supported yet; the log names the format.
+- 10-bit signals are converted to 8-bit. HDR10 (PQ) signals are decoded to linear Rec. 709 in
+  the shader, and the source reports itself to OBS as HDR: on an SDR canvas OBS tone-maps it,
+  the *HDR Tone Mapping* filter works on it, and HDR canvases get it unchanged. The V4L2 format
+  never reports a transfer function, so the source reads PQ from the HDR infoframe through the
+  driver's private ioctl, and follows HDR being switched on and off. HLG is shown as SDR.
+- Sources only send 10-bit and HDR when the receiver's EDID advertises them, and the vendor
+  driver's default EDID doesn't. Pick one in the source's **EDID** property:
+  - *Leave unchanged* (default) keeps whatever the receiver presents.
+  - *SDR, up to 4K60 4:2:0 (340 MHz)* is the driver's default.
+  - *SDR, up to 4K60 4:4:4 (600 MHz)*.
+  - *HDR10 and 10-bit, up to 4K60 (600 MHz)*.
+
+  These are the driver's own EDIDs, written through V4L2, so no root access is needed. The
+  HDMI source re-detects the receiver as if it was replugged. The choice is re-applied
+  whenever capture starts (the driver puts its own EDID back after a system resume), and
+  Properties show the EDID the receiver presents. Neither EDID offers 10-bit 4:2:0, so 10-bit
+  2160p60 arrives as 4:2:2 (`NV20`). The driver's root-only sysfs switch
+  (`/sys/devices/platform/fdee0000.hdmirx-controller/hdmirx/hdmirx/edid`) keeps presenting the
+  HDR EDID after it was set to `5` once, whatever is written later.
+- The receiver has no 10-bit store for 4:4:4 and RGB: when a source sends HDR that way (macOS
+  can), it is kept at 8 bits, which may band in gradients. Properties flag this.
+- For 10-bit 2160p60 4:2:2 the receiver reports a quarter of the real pixel clock and frame
+  rate. The source measures the frame rate from the buffer timestamps, and Properties show
+  the measured values next to the reported ones.
 - Audio comes from the separate HDMI-in ALSA device: add *Audio Input Capture* and pick the
   `hdmiin` device.
 
@@ -170,8 +216,7 @@ after it, and keep the old folder so older releases still build.
 
 CEF follows the OBS release: the build reads the CEF version, revision and SHA-256 for
 `ubuntu-aarch64` from that release's `CMakePresets.json`, so obs-browser and CEF always match.
-OBS 32.2.x pins CEF 6533 (Chromium 127). OBS 33 moves to 7871 (Chromium 150), which the build
-picks up automatically once 33 is released. To force a different build, set `CEF_VERSION`,
+OBS 32.2.x pins CEF 6533 (Chromium 127) and OBS 33 pins 7871 (Chromium 150). To force a different build, set `CEF_VERSION`,
 `CEF_REVISION` and optionally `CEF_SHA256`. A CEF that doesn't match the OBS release's
 obs-browser may not compile.
 
