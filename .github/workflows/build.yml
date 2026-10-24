@@ -4,7 +4,7 @@ on:
   # Poll for new OBS Studio releases. jellyfin-ffmpeg updates alone don't trigger
   # a build; each build uses whatever jellyfin-ffmpeg release is current.
   schedule:
-    - cron: "23 */6 * * *"
+    - cron: "23 3 * * 1"
   workflow_dispatch:
     inputs:
       obs_version:

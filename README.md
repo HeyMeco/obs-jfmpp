@@ -189,7 +189,7 @@ always uses the two RGA3 cores.
 [`.github/workflows/build.yml`](.github/workflows/build.yml) runs only on a schedule and on
 manual triggers:
 
-- **Schedule (every 6 hours):** checks the latest OBS Studio release. If there's no release
+- **Schedule (weekly, Mondays 03:23 UTC):** checks the latest OBS Studio release. If there's no release
   for it here yet (tag `obs-<version>`, e.g. `obs-32.2.2`), it builds both targets on GitHub's
   arm64 runners using the jellyfin-ffmpeg release current at that moment. It then installs
   each package in a clean container as a smoke test and publishes a GitHub release. A new
