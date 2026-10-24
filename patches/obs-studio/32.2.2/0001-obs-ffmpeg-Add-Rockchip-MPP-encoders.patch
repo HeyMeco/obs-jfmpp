@@ -1,0 +1,434 @@
+diff --git a/plugins/obs-ffmpeg/CMakeLists.txt b/plugins/obs-ffmpeg/CMakeLists.txt
+index 7d37eeb..b91df3e 100644
+--- a/plugins/obs-ffmpeg/CMakeLists.txt
++++ b/plugins/obs-ffmpeg/CMakeLists.txt
+@@ -7,6 +7,10 @@ if(OS_LINUX OR OS_WINDOWS)
+   option(ENABLE_FFMPEG_NVENC "Enable legacy FFmpeg NVENC encoder" OFF)
+ endif()
+ 
++if(OS_LINUX)
++  option(ENABLE_RKMPP "Enable Rockchip MPP encoders (requires FFmpeg with rkmpp)" OFF)
++endif()
++
+ include(cmake/dependencies.cmake)
+ 
+ add_library(obs-ffmpeg MODULE)
+@@ -19,6 +23,7 @@ target_sources(
+   PRIVATE
+     $<$<BOOL:${ENABLE_FFMPEG_LOGGING}>:obs-ffmpeg-logging.c>
+     $<$<BOOL:${ENABLE_FFMPEG_NVENC}>:obs-ffmpeg-nvenc.c>
++    $<$<BOOL:${ENABLE_RKMPP}>:obs-ffmpeg-rkmpp.c>
+     $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:obs-ffmpeg-mpegts.c>
+     $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:obs-ffmpeg-rist.h>
+     $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:obs-ffmpeg-srt.h>
+@@ -47,6 +52,7 @@ target_compile_definitions(
+   PRIVATE
+     $<$<BOOL:${ENABLE_FFMPEG_LOGGING}>:ENABLE_FFMPEG_LOGGING>
+     $<$<BOOL:${ENABLE_FFMPEG_NVENC}>:ENABLE_FFMPEG_NVENC>
++    $<$<BOOL:${ENABLE_RKMPP}>:ENABLE_RKMPP>
+     $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:NEW_MPEGTS_OUTPUT>
+ )
+ 
+diff --git a/plugins/obs-ffmpeg/data/locale/en-US.ini b/plugins/obs-ffmpeg/data/locale/en-US.ini
+index 2331d1e..7342c80 100644
+--- a/plugins/obs-ffmpeg/data/locale/en-US.ini
++++ b/plugins/obs-ffmpeg/data/locale/en-US.ini
+@@ -122,6 +122,10 @@ NVENC.TooManySessions="NVENC Error: Too many concurrent sessions. Try closing ot
+ NVENC.CheckDrivers="Try installing the latest <a href=\"https://obsproject.com/go/nvidia-drivers\">NVIDIA driver</a>."
+ 
+ AV1.8bitUnsupportedHdr="OBS does not support 8-bit output of Rec. 2100."
++RKMPP.H264="Rockchip MPP H.264"
++RKMPP.HEVC="Rockchip MPP HEVC"
++RKMPP.InitError="Failed to open the %1 encoder (%2).<br><br>Check that your user can read and write /dev/mpp_service, /dev/rga and /dev/dma_heap/*. Rockchip MPP's own error messages are printed to the terminal and to the system log (journalctl -t mpp)."
++RKMPP.HdrUnsupported="The Rockchip MPP encoders do not support Rec. 2100 (HDR) output."
+ 
+ H264.UnsupportedVideoFormat="Only video formats using 8-bit color are supported."
+ H264.UnsupportedColorSpace="Only the Rec. 709 color space is supported."
+diff --git a/plugins/obs-ffmpeg/obs-ffmpeg-rkmpp.c b/plugins/obs-ffmpeg/obs-ffmpeg-rkmpp.c
+new file mode 100644
+index 0000000..c7800f9
+--- /dev/null
++++ b/plugins/obs-ffmpeg/obs-ffmpeg-rkmpp.c
+@@ -0,0 +1,322 @@
++/******************************************************************************
++    Rockchip MPP (rkmpp) H.264/HEVC encoders via jellyfin-ffmpeg.
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++******************************************************************************/
++
++#include "obs-ffmpeg-video-encoders.h"
++
++#define do_log(level, format, ...) \
++	blog(level, "[rkmpp encoder: '%s'] " format, obs_encoder_get_name(enc->ffve.encoder), ##__VA_ARGS__)
++
++#define warn(format, ...) do_log(LOG_WARNING, format, ##__VA_ARGS__)
++#define info(format, ...) do_log(LOG_INFO, format, ##__VA_ARGS__)
++
++enum rkmpp_codec {
++	RKMPP_CODEC_H264,
++	RKMPP_CODEC_HEVC,
++};
++
++struct rkmpp_encoder {
++	struct ffmpeg_video_encoder ffve;
++	enum rkmpp_codec codec;
++
++	DARRAY(uint8_t) header;
++};
++
++static const char *h264_rkmpp_getname(void *unused)
++{
++	UNUSED_PARAMETER(unused);
++	return obs_module_text("RKMPP.H264");
++}
++
++static const char *hevc_rkmpp_getname(void *unused)
++{
++	UNUSED_PARAMETER(unused);
++	return obs_module_text("RKMPP.HEVC");
++}
++
++/* The software-frame path of the MPP encoders handles 8-bit 4:2:0 input. */
++static void rkmpp_video_info(void *data, struct video_scale_info *info)
++{
++	UNUSED_PARAMETER(data);
++
++	if (info->format != VIDEO_FORMAT_NV12 && info->format != VIDEO_FORMAT_I420)
++		info->format = VIDEO_FORMAT_NV12;
++}
++
++static bool rkmpp_update(struct rkmpp_encoder *enc, obs_data_t *settings)
++{
++	const char *rc = obs_data_get_string(settings, "rate_control");
++	int bitrate = (int)obs_data_get_int(settings, "bitrate");
++	int max_bitrate = (int)obs_data_get_int(settings, "max_bitrate");
++	int cqp = (int)obs_data_get_int(settings, "cqp");
++	int keyint_sec = (int)obs_data_get_int(settings, "keyint_sec");
++	const char *profile = obs_data_get_string(settings, "profile");
++	void *priv = enc->ffve.context->priv_data;
++
++	video_t *video = obs_encoder_video(enc->ffve.encoder);
++	const struct video_output_info *voi = video_output_get_info(video);
++	struct video_scale_info info;
++
++	info.format = voi->format;
++	info.colorspace = voi->colorspace;
++	info.range = voi->range;
++	rkmpp_video_info(enc, &info);
++
++	if (astrcmpi(rc, "CQP") == 0) {
++		bitrate = 0;
++		max_bitrate = 0;
++		av_opt_set(priv, "rc_mode", "CQP", 0);
++		av_opt_set_int(priv, "qp_init", cqp, 0);
++	} else if (astrcmpi(rc, "VBR") == 0) {
++		cqp = 0;
++		if (max_bitrate < bitrate)
++			max_bitrate = bitrate;
++		av_opt_set(priv, "rc_mode", "VBR", 0);
++		enc->ffve.context->rc_max_rate = max_bitrate * INT64_C(1000);
++	} else { /* CBR by default */
++		rc = "CBR";
++		cqp = 0;
++		max_bitrate = bitrate;
++		av_opt_set(priv, "rc_mode", "CBR", 0);
++	}
++
++	if (*profile)
++		av_opt_set(priv, "profile", profile, 0);
++
++	/* 0 = auto; FFmpeg's default GOP of 12 frames is far too short */
++	if (!keyint_sec)
++		keyint_sec = 2;
++
++	const char *ffmpeg_opts = obs_data_get_string(settings, "ffmpeg_opts");
++	ffmpeg_video_encoder_update(&enc->ffve, bitrate, keyint_sec, voi, &info, ffmpeg_opts);
++
++	info("settings:\n"
++	     "\tencoder:      %s\n"
++	     "\trate_control: %s\n"
++	     "\tbitrate:      %d\n"
++	     "\tmax_bitrate:  %d\n"
++	     "\tcqp:          %d\n"
++	     "\tkeyint:       %d\n"
++	     "\tprofile:      %s\n"
++	     "\twidth:        %d\n"
++	     "\theight:       %d\n"
++	     "\tffmpeg opts:  %s\n",
++	     enc->ffve.enc_name, rc, bitrate, max_bitrate, cqp, enc->ffve.context->gop_size, profile,
++	     enc->ffve.context->width, enc->ffve.height, ffmpeg_opts);
++
++	/* SPS/PPS(/VPS) go into extradata instead of in front of every IDR */
++	enc->ffve.context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
++	if (!ffmpeg_video_encoder_init_codec(&enc->ffve))
++		return false;
++
++	/* rkmpp reports the header size including the zeroed input padding */
++	int size = enc->ffve.context->extradata_size;
++	const uint8_t *extradata = enc->ffve.context->extradata;
++	while (size > 0 && extradata[size - 1] == 0)
++		size--;
++	da_copy_array(enc->header, extradata, size);
++
++	return true;
++}
++
++static void rkmpp_on_init_error(void *data, int ret)
++{
++	struct rkmpp_encoder *enc = data;
++	struct dstr error_message = {0};
++
++	dstr_copy(&error_message, obs_module_text("RKMPP.InitError"));
++	dstr_replace(&error_message, "%1", enc->ffve.enc_name);
++	dstr_replace(&error_message, "%2", av_err2str(ret));
++	obs_encoder_set_last_error(enc->ffve.encoder, error_message.array);
++	dstr_free(&error_message);
++}
++
++static void rkmpp_destroy(void *data)
++{
++	struct rkmpp_encoder *enc = data;
++
++	ffmpeg_video_encoder_free(&enc->ffve);
++	da_free(enc->header);
++	bfree(enc);
++}
++
++static void *rkmpp_create_internal(obs_data_t *settings, obs_encoder_t *encoder, enum rkmpp_codec codec,
++				   const char *enc_lib, const char *enc_name)
++{
++	video_t *video = obs_encoder_video(encoder);
++	const struct video_output_info *voi = video_output_get_info(video);
++
++	if (voi->colorspace == VIDEO_CS_2100_PQ || voi->colorspace == VIDEO_CS_2100_HLG) {
++		const char *const text = obs_module_text("RKMPP.HdrUnsupported");
++		obs_encoder_set_last_error(encoder, text);
++		blog(LOG_ERROR, "[rkmpp encoder] %s", text);
++		return NULL;
++	}
++
++	struct rkmpp_encoder *enc = bzalloc(sizeof(*enc));
++	enc->codec = codec;
++
++	if (!ffmpeg_video_encoder_init(&enc->ffve, enc, encoder, enc_lib, NULL, enc_name, rkmpp_on_init_error, NULL))
++		goto fail;
++	if (!rkmpp_update(enc, settings))
++		goto fail;
++
++	return enc;
++
++fail:
++	rkmpp_destroy(enc);
++	return NULL;
++}
++
++static void *h264_rkmpp_create(obs_data_t *settings, obs_encoder_t *encoder)
++{
++	return rkmpp_create_internal(settings, encoder, RKMPP_CODEC_H264, "h264_rkmpp", "Rockchip MPP H.264");
++}
++
++static void *hevc_rkmpp_create(obs_data_t *settings, obs_encoder_t *encoder)
++{
++	return rkmpp_create_internal(settings, encoder, RKMPP_CODEC_HEVC, "hevc_rkmpp", "Rockchip MPP HEVC");
++}
++
++static bool rkmpp_encode(void *data, struct encoder_frame *frame, struct encoder_packet *packet,
++			 bool *received_packet)
++{
++	struct rkmpp_encoder *enc = data;
++	return ffmpeg_video_encode(&enc->ffve, frame, packet, received_packet);
++}
++
++static void rkmpp_defaults_internal(obs_data_t *settings, const char *profile)
++{
++	obs_data_set_default_string(settings, "rate_control", "CBR");
++	obs_data_set_default_int(settings, "bitrate", 6000);
++	obs_data_set_default_int(settings, "max_bitrate", 9000);
++	obs_data_set_default_int(settings, "cqp", 23);
++	obs_data_set_default_int(settings, "keyint_sec", 0);
++	obs_data_set_default_string(settings, "profile", profile);
++}
++
++static void h264_rkmpp_defaults(obs_data_t *settings)
++{
++	rkmpp_defaults_internal(settings, "high");
++}
++
++static void hevc_rkmpp_defaults(obs_data_t *settings)
++{
++	rkmpp_defaults_internal(settings, "main");
++}
++
++static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs_data_t *settings)
++{
++	const char *rc = obs_data_get_string(settings, "rate_control");
++	bool cqp = astrcmpi(rc, "CQP") == 0;
++	bool vbr = astrcmpi(rc, "VBR") == 0;
++
++	p = obs_properties_get(ppts, "bitrate");
++	obs_property_set_visible(p, !cqp);
++	p = obs_properties_get(ppts, "max_bitrate");
++	obs_property_set_visible(p, vbr);
++	p = obs_properties_get(ppts, "cqp");
++	obs_property_set_visible(p, cqp);
++
++	return true;
++}
++
++static obs_properties_t *rkmpp_properties_internal(enum rkmpp_codec codec)
++{
++	obs_properties_t *props = obs_properties_create();
++	obs_property_t *p;
++
++	p = obs_properties_add_list(props, "rate_control", obs_module_text("RateControl"), OBS_COMBO_TYPE_LIST,
++				    OBS_COMBO_FORMAT_STRING);
++	obs_property_list_add_string(p, "CBR", "CBR");
++	obs_property_list_add_string(p, "VBR", "VBR");
++	obs_property_list_add_string(p, "CQP", "CQP");
++	obs_property_set_modified_callback(p, rate_control_modified);
++
++	p = obs_properties_add_int(props, "bitrate", obs_module_text("Bitrate"), 50, 300000, 50);
++	obs_property_int_set_suffix(p, " Kbps");
++
++	p = obs_properties_add_int(props, "max_bitrate", obs_module_text("MaxBitrate"), 50, 300000, 50);
++	obs_property_int_set_suffix(p, " Kbps");
++
++	obs_properties_add_int(props, "cqp", "QP", 1, 51, 1);
++
++	p = obs_properties_add_int(props, "keyint_sec", obs_module_text("KeyframeIntervalSec"), 0, 10, 1);
++	obs_property_int_set_suffix(p, " s");
++
++	p = obs_properties_add_list(props, "profile", obs_module_text("Profile"), OBS_COMBO_TYPE_LIST,
++				    OBS_COMBO_FORMAT_STRING);
++	if (codec == RKMPP_CODEC_H264) {
++		obs_property_list_add_string(p, "high", "high");
++		obs_property_list_add_string(p, "main", "main");
++		obs_property_list_add_string(p, "baseline", "baseline");
++	} else {
++		obs_property_list_add_string(p, "main", "main");
++	}
++
++	obs_properties_add_text(props, "ffmpeg_opts", obs_module_text("FFmpegOpts"), OBS_TEXT_DEFAULT);
++
++	return props;
++}
++
++static obs_properties_t *h264_rkmpp_properties(void *unused)
++{
++	UNUSED_PARAMETER(unused);
++	return rkmpp_properties_internal(RKMPP_CODEC_H264);
++}
++
++static obs_properties_t *hevc_rkmpp_properties(void *unused)
++{
++	UNUSED_PARAMETER(unused);
++	return rkmpp_properties_internal(RKMPP_CODEC_HEVC);
++}
++
++static bool rkmpp_extra_data(void *data, uint8_t **extra_data, size_t *size)
++{
++	struct rkmpp_encoder *enc = data;
++
++	*extra_data = enc->header.array;
++	*size = enc->header.num;
++	return true;
++}
++
++struct obs_encoder_info h264_rkmpp_encoder_info = {
++	.id = "ffmpeg_rkmpp_h264",
++	.type = OBS_ENCODER_VIDEO,
++	.codec = "h264",
++	.get_name = h264_rkmpp_getname,
++	.create = h264_rkmpp_create,
++	.destroy = rkmpp_destroy,
++	.encode = rkmpp_encode,
++	.get_defaults = h264_rkmpp_defaults,
++	.get_properties = h264_rkmpp_properties,
++	.get_extra_data = rkmpp_extra_data,
++	.get_video_info = rkmpp_video_info,
++};
++
++struct obs_encoder_info hevc_rkmpp_encoder_info = {
++	.id = "ffmpeg_rkmpp_hevc",
++	.type = OBS_ENCODER_VIDEO,
++	.codec = "hevc",
++	.get_name = hevc_rkmpp_getname,
++	.create = hevc_rkmpp_create,
++	.destroy = rkmpp_destroy,
++	.encode = rkmpp_encode,
++	.get_defaults = hevc_rkmpp_defaults,
++	.get_properties = hevc_rkmpp_properties,
++	.get_extra_data = rkmpp_extra_data,
++	.get_video_info = rkmpp_video_info,
++};
+diff --git a/plugins/obs-ffmpeg/obs-ffmpeg.c b/plugins/obs-ffmpeg/obs-ffmpeg.c
+index d7880e5..61ddd7a 100644
+--- a/plugins/obs-ffmpeg/obs-ffmpeg.c
++++ b/plugins/obs-ffmpeg/obs-ffmpeg.c
+@@ -323,6 +323,35 @@ static bool hevc_vaapi_supported(void)
+ #endif
+ #endif
+ 
++#ifdef ENABLE_RKMPP
++#include <stdlib.h>
++#include <unistd.h>
++
++extern struct obs_encoder_info h264_rkmpp_encoder_info;
++extern struct obs_encoder_info hevc_rkmpp_encoder_info;
++
++/* The MPP kernel driver exposes one of these depending on the BSP kernel. */
++static bool rkmpp_device_available(void)
++{
++	static const char *const nodes[] = {"/dev/mpp_service", "/dev/vpu_service", "/dev/rkvenc", "/dev/vepu"};
++
++	for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
++		if (access(nodes[i], F_OK) != 0)
++			continue;
++
++		/* MPP opens the node read-write; without that, mpp_init() fails with -1. */
++		if (access(nodes[i], R_OK | W_OK) != 0)
++			blog(LOG_WARNING,
++			     "Rockchip MPP: no read/write access to %s, encoding will fail. "
++			     "Give your user access to it, /dev/rga and /dev/dma_heap/* "
++			     "(e.g. the 'video' group or a udev rule)",
++			     nodes[i]);
++		return true;
++	}
++	return false;
++}
++#endif
++
+ #if defined(_WIN32) && !defined(_M_ARM64)
+ extern void amf_load(void);
+ extern void amf_unload(void);
+@@ -411,6 +440,19 @@ bool obs_module_load(void)
+ #endif
+ #endif
+ 
++#ifdef ENABLE_RKMPP
++	/* MPP logs to syslog only by default; mirror its errors to stderr. */
++	setenv("mpp_syslog_perror", "1", 0);
++
++	if (rkmpp_device_available()) {
++		blog(LOG_INFO, "Rockchip MPP device found");
++		register_encoder_if_available(&h264_rkmpp_encoder_info, "h264_rkmpp");
++		register_encoder_if_available(&hevc_rkmpp_encoder_info, "hevc_rkmpp");
++	} else {
++		blog(LOG_INFO, "Rockchip MPP encoding not supported (no MPP device)");
++	}
++#endif
++
+ #if ENABLE_FFMPEG_LOGGING
+ 	obs_ffmpeg_load_logging();
+ #endif

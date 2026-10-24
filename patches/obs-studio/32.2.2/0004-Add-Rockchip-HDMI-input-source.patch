@@ -1,0 +1,1215 @@
+diff --git a/plugins/CMakeLists.txt b/plugins/CMakeLists.txt
+index 1bea2e4..6fa5d75 100644
+--- a/plugins/CMakeLists.txt
++++ b/plugins/CMakeLists.txt
+@@ -97,6 +97,7 @@ check_obs_websocket()
+ 
+ add_obs_plugin(obs-x264)
+ add_obs_plugin(oss-audio PLATFORMS FREEBSD OPENBSD)
++add_obs_plugin(rockchip-hdmirx PLATFORMS LINUX)
+ add_obs_plugin(rtmp-services)
+ add_obs_plugin(sndio PLATFORMS LINUX FREEBSD OPENBSD)
+ add_obs_plugin(text-freetype2)
+diff --git a/plugins/rockchip-hdmirx/CMakeLists.txt b/plugins/rockchip-hdmirx/CMakeLists.txt
+new file mode 100644
+index 0000000..f7ce790
+--- /dev/null
++++ b/plugins/rockchip-hdmirx/CMakeLists.txt
+@@ -0,0 +1,17 @@
++cmake_minimum_required(VERSION 3.28...3.30)
++
++option(ENABLE_ROCKCHIP_HDMIRX "Build OBS with Rockchip HDMI input support" ON)
++
++if(NOT ENABLE_ROCKCHIP_HDMIRX)
++  target_disable(rockchip-hdmirx)
++  return()
++endif()
++
++add_library(rockchip-hdmirx MODULE)
++add_library(OBS::rockchip-hdmirx ALIAS rockchip-hdmirx)
++
++target_sources(rockchip-hdmirx PRIVATE rockchip-hdmirx.c)
++
++target_link_libraries(rockchip-hdmirx PRIVATE OBS::libobs)
++
++set_target_properties_obs(rockchip-hdmirx PROPERTIES FOLDER plugins PREFIX "")
+diff --git a/plugins/rockchip-hdmirx/data/hdmirx.effect b/plugins/rockchip-hdmirx/data/hdmirx.effect
+new file mode 100644
+index 0000000..6be2617
+--- /dev/null
++++ b/plugins/rockchip-hdmirx/data/hdmirx.effect
+@@ -0,0 +1,68 @@
++// Draws rk_hdmirx capture buffers imported as dma-buf textures.
++//   NV12/NV16/NV24: image = Y (R8), image1 = CbCr (R8G8, R = Cb)
++//   BGR3:           image = packed B,G,R bytes as R8 at 3x width
++
++uniform float4x4 ViewProj;
++uniform texture2d image;
++uniform texture2d image1;
++
++uniform float4x4 color_matrix;
++uniform float3 color_range_min = {0.0, 0.0, 0.0};
++uniform float3 color_range_max = {1.0, 1.0, 1.0};
++uniform float2 frame_size;
++
++sampler_state def_sampler {
++	Filter   = Linear;
++	AddressU = Clamp;
++	AddressV = Clamp;
++};
++
++struct VertInOut {
++	float4 pos : POSITION;
++	float2 uv  : TEXCOORD0;
++};
++
++VertInOut VSDefault(VertInOut vert_in)
++{
++	VertInOut vert_out;
++	vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
++	vert_out.uv  = vert_in.uv;
++	return vert_out;
++}
++
++float4 PSYCbCr(VertInOut vert_in) : TARGET
++{
++	float y = image.Sample(def_sampler, vert_in.uv).r;
++	float2 cbcr = image1.Sample(def_sampler, vert_in.uv).rg;
++	float3 yuv = clamp(float3(y, cbcr), color_range_min, color_range_max);
++	return saturate(mul(float4(yuv, 1.0), color_matrix));
++}
++
++float4 PSBGR3(VertInOut vert_in) : TARGET
++{
++	int2 xy = int2(min(vert_in.uv * frame_size, frame_size - 1.0));
++	int x = xy.x * 3;
++	float b = image.Load(int3(x, xy.y, 0)).r;
++	float g = image.Load(int3(x + 1, xy.y, 0)).r;
++	float r = image.Load(int3(x + 2, xy.y, 0)).r;
++	float3 rgb = (float3(r, g, b) - color_range_min) / (color_range_max - color_range_min);
++	return float4(saturate(rgb), 1.0);
++}
++
++technique YCbCr
++{
++	pass
++	{
++		vertex_shader = VSDefault(vert_in);
++		pixel_shader  = PSYCbCr(vert_in);
++	}
++}
++
++technique BGR3
++{
++	pass
++	{
++		vertex_shader = VSDefault(vert_in);
++		pixel_shader  = PSBGR3(vert_in);
++	}
++}
+diff --git a/plugins/rockchip-hdmirx/data/locale/en-US.ini b/plugins/rockchip-hdmirx/data/locale/en-US.ini
+new file mode 100644
+index 0000000..c362f8b
+--- /dev/null
++++ b/plugins/rockchip-hdmirx/data/locale/en-US.ini
+@@ -0,0 +1,21 @@
++RockchipHdmiRx="Rockchip HDMI Input"
++Device="Device"
++NoDevice="No Rockchip HDMI input found"
++Status="Status"
++Starting="Starting…"
++Capturing="Capturing"
++Resolution="Resolution"
++FrameRate="Frame rate"
++PixelClock="Pixel clock"
++PixelFormat="Pixel format"
++Color="Color"
++LimitedRange="limited range"
++FullRange="full range"
++Frames="Frames"
++Captured="captured"
++Dropped="dropped"
++Refresh="Refresh"
++Conversion="Conversion"
++GpuTextures="GPU textures"
++ImportFailed="import failed (see the log)"
++WaitingForFrame="waiting for the first frame"
+diff --git a/plugins/rockchip-hdmirx/rockchip-hdmirx.c b/plugins/rockchip-hdmirx/rockchip-hdmirx.c
+new file mode 100644
+index 0000000..066d260
+--- /dev/null
++++ b/plugins/rockchip-hdmirx/rockchip-hdmirx.c
+@@ -0,0 +1,1073 @@
++/*
++ * Rockchip HDMI input (rk_hdmirx) source.
++ *
++ * The receiver only delivers the pixel format the HDMI source sends (often
++ * YCbCr 4:4:4, which the generic V4L2 source cannot use), so frames are never
++ * copied or converted on the CPU: capture buffers are exported as dma-bufs,
++ * imported as GPU textures once per buffer, and converted to RGB in a shader.
++ */
++
++#include <obs-module.h>
++#include <media-io/video-io.h>
++#include <util/dstr.h>
++#include <util/platform.h>
++#include <util/threading.h>
++
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <linux/videodev2.h>
++#include <poll.h>
++#include <pthread.h>
++#include <string.h>
++#include <sys/eventfd.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++OBS_DECLARE_MODULE()
++OBS_MODULE_USE_DEFAULT_LOCALE("rockchip-hdmirx", "en-US")
++
++MODULE_EXPORT const char *obs_module_description(void)
++{
++	return "Rockchip HDMI input (rk_hdmirx) with zero-copy GPU conversion";
++}
++
++#define blog_s(s, level, msg, ...) blog(level, "[rockchip-hdmirx: '%s'] " msg, obs_source_get_name((s)->source), ##__VA_ARGS__)
++
++#define FOURCC(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
++#define DRM_FORMAT_R8 FOURCC('R', '8', ' ', ' ')
++#define DRM_FORMAT_GR88 FOURCC('G', 'R', '8', '8')
++
++#define MAX_BUFFERS 8
++#define MIN_BUFFERS 4
++/* Ticks a buffer stays out of the queue after it was last drawn, so the GPU
++ * has finished reading it before the receiver writes into it again. */
++#define RETIRE_TICKS 3
++#define NO_FRAME_TIMEOUT_MS 2000
++#define RETRY_MS 1000
++/* Signal lock after a receiver reset takes about 2.5 s. */
++#define RESET_SETTLE_MS 3000
++#define RESET_INTERVAL_NS (30 * 1000000000ULL)
++
++/* From the vendor kernel's uapi/linux/rk_hdmirx_config.h. */
++#define RK_HDMIRX_CMD_SOFT_RESET _IO('V', BASE_VIDIOC_PRIVATE + 6)
++
++struct gpu_plane {
++	uint32_t drm_format;
++	enum gs_color_format gs_format;
++	uint32_t width, height, pitch, offset;
++	uint32_t v4l2_plane;
++};
++
++struct hdmirx_layout {
++	uint32_t fourcc;
++	uint32_t width, height;
++	uint32_t v4l2_planes;
++	uint32_t gpu_planes;
++	struct gpu_plane plane[2];
++	const char *technique;
++};
++
++struct hdmirx_buffer {
++	int dmabuf[VIDEO_MAX_PLANES];
++	gs_texture_t *tex[2];
++	int retire_age; /* -1 while queued, displayed or ready */
++};
++
++struct hdmirx_source {
++	obs_source_t *source;
++	char *device;
++
++	pthread_t thread;
++	bool thread_running;
++	volatile bool stop;
++	int wake_fd;
++
++	gs_effect_t *effect;
++
++	/* Everything below is shared between the capture thread, video_tick and
++	 * video_render and protected by mutex. Lock order: graphics, then mutex. */
++	pthread_mutex_t mutex;
++	int fd; /* -1 while not streaming */
++	struct hdmirx_layout layout;
++	struct v4l2_bt_timings timings;
++	struct hdmirx_buffer buffers[MAX_BUFFERS];
++	uint32_t num_buffers;
++	int ready;     /* newest captured buffer, not yet picked up by tick */
++	int displayed; /* buffer drawn by video_render */
++	bool import_failed;
++	float color_matrix[16];
++	float color_range_min[3];
++	float color_range_max[3];
++	enum video_colorspace colorspace;
++	enum video_range_type range;
++	uint64_t frames_captured;
++	uint64_t frames_dropped; /* replaced before video_tick picked them up */
++
++	/* Written by the capture thread, read by the properties. */
++	struct dstr last_status;
++	int last_status_level;
++
++	/* capture thread only */
++	uint64_t last_reset_ns;
++	bool format_mismatch;
++};
++
++static int xioctl(int fd, unsigned long request, void *arg)
++{
++	int ret;
++	do {
++		ret = ioctl(fd, request, arg);
++	} while (ret < 0 && errno == EINTR);
++	return ret;
++}
++
++static const char *fourcc_name(uint32_t fourcc, char out[5])
++{
++	memcpy(out, &fourcc, 4);
++	out[4] = 0;
++	return out;
++}
++
++static double timings_fps(const struct v4l2_bt_timings *bt)
++{
++	uint64_t total = (uint64_t)V4L2_DV_BT_FRAME_WIDTH(bt) * V4L2_DV_BT_FRAME_HEIGHT(bt);
++	return total ? (double)bt->pixelclock / (double)total : 0.0;
++}
++
++static const char *fourcc_description(uint32_t fourcc)
++{
++	switch (fourcc) {
++	case V4L2_PIX_FMT_NV24:
++		return "YCbCr 4:4:4, 8-bit";
++	case V4L2_PIX_FMT_NV16:
++		return "YCbCr 4:2:2, 8-bit";
++	case V4L2_PIX_FMT_NV12:
++		return "YCbCr 4:2:0, 8-bit";
++	case V4L2_PIX_FMT_BGR24:
++		return "RGB, 8-bit";
++	default:
++		return NULL;
++	}
++}
++
++/* Log only when the state changes, so a missing signal doesn't flood the log.
++ * An open properties window reloads to show the new state. */
++static void set_status(struct hdmirx_source *s, int level, const char *status)
++{
++	pthread_mutex_lock(&s->mutex);
++	if (s->last_status.array && strcmp(s->last_status.array, status) == 0) {
++		pthread_mutex_unlock(&s->mutex);
++		return;
++	}
++	dstr_copy(&s->last_status, status);
++	s->last_status_level = level;
++	pthread_mutex_unlock(&s->mutex);
++
++	blog_s(s, level, "%s", status);
++	obs_source_update_properties(s->source);
++}
++
++static bool make_layout(const struct v4l2_pix_format_mplane *mp, struct hdmirx_layout *l)
++{
++	uint32_t w = mp->width, h = mp->height;
++	uint32_t pitch0 = mp->plane_fmt[0].bytesperline;
++	bool split = mp->num_planes > 1;
++
++	memset(l, 0, sizeof(*l));
++	l->fourcc = mp->pixelformat;
++	l->width = w;
++	l->height = h;
++	l->v4l2_planes = mp->num_planes;
++
++	switch (mp->pixelformat) {
++	case V4L2_PIX_FMT_BGR24:
++		l->gpu_planes = 1;
++		l->plane[0] = (struct gpu_plane){DRM_FORMAT_R8, GS_R8, w * 3, h, pitch0, 0, 0};
++		l->technique = "BGR3";
++		return true;
++
++	case V4L2_PIX_FMT_NV12:
++	case V4L2_PIX_FMT_NV16:
++	case V4L2_PIX_FMT_NV24: {
++		bool full_w = mp->pixelformat == V4L2_PIX_FMT_NV24;
++		bool full_h = mp->pixelformat != V4L2_PIX_FMT_NV12;
++		uint32_t chroma_pitch = split ? mp->plane_fmt[1].bytesperline : (full_w ? pitch0 * 2 : pitch0);
++
++		l->gpu_planes = 2;
++		l->plane[0] = (struct gpu_plane){DRM_FORMAT_R8, GS_R8, w, h, pitch0, 0, 0};
++		l->plane[1] = (struct gpu_plane){
++			.drm_format = DRM_FORMAT_GR88,
++			.gs_format = GS_R8G8,
++			.width = full_w ? w : w / 2,
++			.height = full_h ? h : h / 2,
++			.pitch = chroma_pitch,
++			.offset = split ? 0 : pitch0 * h,
++			.v4l2_plane = split ? 1 : 0,
++		};
++		l->technique = "YCbCr";
++		return true;
++	}
++	}
++	return false;
++}
++
++static void set_color_params(struct hdmirx_source *s, const struct v4l2_pix_format_mplane *mp)
++{
++	bool rgb = mp->pixelformat == V4L2_PIX_FMT_BGR24;
++	enum video_colorspace cs = VIDEO_CS_709;
++	enum video_range_type range;
++
++	switch (mp->ycbcr_enc) {
++	case V4L2_YCBCR_ENC_601:
++	case V4L2_YCBCR_ENC_XV601:
++		cs = VIDEO_CS_601;
++		break;
++	case V4L2_YCBCR_ENC_DEFAULT:
++		cs = mp->height < 720 ? VIDEO_CS_601 : VIDEO_CS_709;
++		break;
++	default:
++		break;
++	}
++
++	if (mp->quantization == V4L2_QUANTIZATION_FULL_RANGE) {
++		range = VIDEO_RANGE_FULL;
++	} else if (mp->quantization == V4L2_QUANTIZATION_LIM_RANGE) {
++		range = VIDEO_RANGE_PARTIAL;
++	} else {
++		range = rgb ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
++	}
++
++	if (rgb) {
++		float lo = range == VIDEO_RANGE_FULL ? 0.0f : 16.0f / 255.0f;
++		float hi = range == VIDEO_RANGE_FULL ? 1.0f : 235.0f / 255.0f;
++		for (int i = 0; i < 3; i++) {
++			s->color_range_min[i] = lo;
++			s->color_range_max[i] = hi;
++		}
++	} else {
++		video_format_get_parameters_for_format(cs, range, VIDEO_FORMAT_NV12, s->color_matrix,
++						       s->color_range_min, s->color_range_max);
++	}
++	s->colorspace = cs;
++	s->range = range;
++}
++
++static bool queue_buffer(int fd, uint32_t index, uint32_t num_planes)
++{
++	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
++	struct v4l2_buffer buf = {
++		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++		.memory = V4L2_MEMORY_MMAP,
++		.index = index,
++		.m.planes = planes,
++		.length = num_planes,
++	};
++	return xioctl(fd, VIDIOC_QBUF, &buf) == 0;
++}
++
++/* --- capture thread ----------------------------------------------------- */
++
++static void stream_teardown(struct hdmirx_source *s)
++{
++	uint64_t captured, dropped;
++	int fd;
++
++	obs_enter_graphics();
++	pthread_mutex_lock(&s->mutex);
++	fd = s->fd;
++	captured = s->frames_captured;
++	dropped = s->frames_dropped;
++	s->frames_captured = s->frames_dropped = 0;
++	for (uint32_t i = 0; i < s->num_buffers; i++) {
++		struct hdmirx_buffer *b = &s->buffers[i];
++		for (int p = 0; p < 2; p++) {
++			gs_texture_destroy(b->tex[p]);
++			b->tex[p] = NULL;
++		}
++		for (int p = 0; p < VIDEO_MAX_PLANES; p++) {
++			if (b->dmabuf[p] >= 0) {
++				close(b->dmabuf[p]);
++			}
++			b->dmabuf[p] = -1;
++		}
++	}
++	s->fd = -1;
++	s->num_buffers = 0;
++	s->ready = s->displayed = -1;
++	s->import_failed = false;
++	memset(&s->layout, 0, sizeof(s->layout));
++	pthread_mutex_unlock(&s->mutex);
++	obs_leave_graphics();
++
++	if (fd >= 0) {
++		int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++		xioctl(fd, VIDIOC_STREAMOFF, &type);
++		close(fd);
++		blog_s(s, LOG_INFO, "Capture stopped: %" PRIu64 " frames, %" PRIu64 " dropped", captured, dropped);
++	}
++}
++
++static bool query_signal(struct hdmirx_source *s, int fd, struct v4l2_dv_timings *timings)
++{
++	memset(timings, 0, sizeof(*timings));
++	if (xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, timings) == 0) {
++		return true;
++	}
++
++	switch (errno) {
++	case ENOLINK:
++		set_status(s, LOG_INFO, "No HDMI signal");
++		break;
++	case ENOLCK:
++		set_status(s, LOG_INFO, "HDMI signal not locked");
++		break;
++	default:
++		set_status(s, LOG_WARNING, "Unable to query HDMI timings");
++		break;
++	}
++	return false;
++}
++
++/* S_DV_TIMINGS only accepts CEA-861 timings, and that check compares the
++ * sync polarities too. Sources often send standard modes with other polarities
++ * (macOS sends 3840x2160p60 with negative sync), so retry with the others. */
++static bool set_timings(int fd, struct v4l2_dv_timings *timings)
++{
++	uint32_t detected = timings->bt.polarities;
++	static const uint32_t all[] = {
++		V4L2_DV_HSYNC_POS_POL | V4L2_DV_VSYNC_POS_POL,
++		0,
++		V4L2_DV_HSYNC_POS_POL,
++		V4L2_DV_VSYNC_POS_POL,
++	};
++
++	if (xioctl(fd, VIDIOC_S_DV_TIMINGS, timings) == 0) {
++		return true;
++	}
++	for (size_t i = 0; i < sizeof(all) / sizeof(all[0]) && errno == EINVAL; i++) {
++		if (all[i] == detected) {
++			continue;
++		}
++		timings->bt.polarities = all[i];
++		if (xioctl(fd, VIDIOC_S_DV_TIMINGS, timings) == 0) {
++			return true;
++		}
++	}
++	timings->bt.polarities = detected;
++	return false;
++}
++
++static bool stream_setup(struct hdmirx_source *s)
++{
++	struct v4l2_capability cap = {0};
++	struct v4l2_dv_timings timings;
++	struct v4l2_format fmt = {.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE};
++	struct v4l2_requestbuffers req = {
++		.count = MAX_BUFFERS,
++		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++		.memory = V4L2_MEMORY_MMAP,
++	};
++	struct v4l2_event_subscription sub = {.type = V4L2_EVENT_SOURCE_CHANGE};
++	struct hdmirx_buffer buffers[MAX_BUFFERS];
++	struct hdmirx_layout layout;
++	struct dstr status = {0};
++	char fourcc[5];
++	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	int fd;
++
++	if (!s->device || !*s->device) {
++		set_status(s, LOG_WARNING, "No device selected");
++		return false;
++	}
++
++	fd = open(s->device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++	if (fd < 0) {
++		dstr_printf(&status, "Unable to open %s: %s", s->device, strerror(errno));
++		set_status(s, LOG_WARNING, status.array);
++		dstr_free(&status);
++		return false;
++	}
++
++	if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0 || !(cap.device_caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE) ||
++	    !(cap.device_caps & V4L2_CAP_STREAMING)) {
++		set_status(s, LOG_WARNING, "Device is not a multi-planar streaming capture device");
++		goto fail;
++	}
++
++	xioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
++
++	if (!query_signal(s, fd, &timings)) {
++		goto fail;
++	}
++	/* Lock the receiver to the detected timings; G_FMT reflects them after this.
++	 * The driver often has them already (it follows the signal by itself) and
++	 * rejects measured timings that are slightly off the CEA-861 table, so only
++	 * a capture format that doesn't match the signal is an error. */
++	int set_err = set_timings(fd, &timings) ? 0 : errno;
++
++	if (xioctl(fd, VIDIOC_G_FMT, &fmt) < 0) {
++		set_status(s, LOG_WARNING, "Unable to read capture format");
++		goto fail;
++	}
++	if (fmt.fmt.pix_mp.width != timings.bt.width || fmt.fmt.pix_mp.height != timings.bt.height) {
++		dstr_printf(&status, "Capture format %ux%u doesn't match the HDMI signal %ux%u", fmt.fmt.pix_mp.width,
++			    fmt.fmt.pix_mp.height, timings.bt.width, timings.bt.height);
++		if (set_err) {
++			dstr_catf(&status, " (setting the timings failed: %s)", strerror(set_err));
++		}
++		set_status(s, LOG_WARNING, status.array);
++		s->format_mismatch = true;
++		goto fail;
++	}
++	if (!make_layout(&fmt.fmt.pix_mp, &layout)) {
++		dstr_printf(&status, "Unsupported pixel format %s from the HDMI source",
++			    fourcc_name(fmt.fmt.pix_mp.pixelformat, fourcc));
++		set_status(s, LOG_WARNING, status.array);
++		goto fail;
++	}
++
++	if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0 || req.count < MIN_BUFFERS) {
++		dstr_printf(&status, "Unable to allocate capture buffers (%s, got %u)", strerror(errno), req.count);
++		set_status(s, LOG_WARNING, status.array);
++		goto fail;
++	}
++	if (req.count > MAX_BUFFERS) {
++		req.count = MAX_BUFFERS;
++	}
++
++	memset(buffers, 0, sizeof(buffers));
++	for (uint32_t i = 0; i < MAX_BUFFERS; i++) {
++		buffers[i].retire_age = -1;
++		for (int p = 0; p < VIDEO_MAX_PLANES; p++) {
++			buffers[i].dmabuf[p] = -1;
++		}
++	}
++
++	for (uint32_t i = 0; i < req.count; i++) {
++		for (uint32_t p = 0; p < layout.v4l2_planes; p++) {
++			struct v4l2_exportbuffer exp = {
++				.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++				.index = i,
++				.plane = p,
++				.flags = O_RDONLY | O_CLOEXEC,
++			};
++			if (xioctl(fd, VIDIOC_EXPBUF, &exp) < 0) {
++				set_status(s, LOG_WARNING, "Unable to export capture buffers as dma-buf");
++				goto fail_buffers;
++			}
++			buffers[i].dmabuf[p] = exp.fd;
++		}
++		if (!queue_buffer(fd, i, layout.v4l2_planes)) {
++			set_status(s, LOG_WARNING, "Unable to queue capture buffers");
++			goto fail_buffers;
++		}
++	}
++
++	if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
++		dstr_printf(&status, "Unable to start streaming: %s", strerror(errno));
++		set_status(s, LOG_WARNING, status.array);
++		goto fail_buffers;
++	}
++
++	pthread_mutex_lock(&s->mutex);
++	s->fd = fd;
++	s->layout = layout;
++	s->timings = timings.bt;
++	memcpy(s->buffers, buffers, sizeof(buffers));
++	s->num_buffers = req.count;
++	s->ready = s->displayed = -1;
++	s->import_failed = false;
++	set_color_params(s, &fmt.fmt.pix_mp);
++	pthread_mutex_unlock(&s->mutex);
++
++	{
++		const struct v4l2_bt_timings *bt = &timings.bt;
++		dstr_printf(&status, "Capturing %ux%u%s @ %.2f Hz, %s, %u buffers", layout.width, layout.height,
++			    bt->interlaced ? "i" : "p", timings_fps(bt), fourcc_name(layout.fourcc, fourcc), req.count);
++		set_status(s, LOG_INFO, status.array);
++	}
++	dstr_free(&status);
++	return true;
++
++fail_buffers:
++	for (uint32_t i = 0; i < MAX_BUFFERS; i++) {
++		for (int p = 0; p < VIDEO_MAX_PLANES; p++) {
++			if (buffers[i].dmabuf[p] >= 0) {
++				close(buffers[i].dmabuf[p]);
++			}
++		}
++	}
++fail:
++	dstr_free(&status);
++	close(fd);
++	return false;
++}
++
++/* A source-change event is also sent when nothing really changed (e.g. on
++ * stream start), so only restart if the timings or the format differ. */
++static bool signal_changed(struct hdmirx_source *s, int fd)
++{
++	struct v4l2_dv_timings timings = {0};
++	struct v4l2_format fmt = {.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE};
++	const struct v4l2_bt_timings *cur = &s->timings;
++
++	if (xioctl(fd, VIDIOC_QUERY_DV_TIMINGS, &timings) < 0) {
++		return true;
++	}
++	if (timings.bt.width != cur->width || timings.bt.height != cur->height ||
++	    timings.bt.interlaced != cur->interlaced || timings.bt.pixelclock != cur->pixelclock) {
++		return true;
++	}
++	if (xioctl(fd, VIDIOC_G_FMT, &fmt) == 0 && fmt.fmt.pix_mp.pixelformat != s->layout.fourcc) {
++		return true;
++	}
++	return false;
++}
++
++/* Returns true when the receiver has a signal but stopped delivering frames. */
++static bool stream_run(struct hdmirx_source *s)
++{
++	int fd = s->fd;
++	uint32_t num_planes = s->layout.v4l2_planes;
++	int idle_ms = 0;
++
++	while (!s->stop) {
++		struct pollfd pfd[2] = {
++			{.fd = fd, .events = POLLIN | POLLPRI},
++			{.fd = s->wake_fd, .events = POLLIN},
++		};
++		int ret = poll(pfd, 2, 500);
++
++		if (s->stop) {
++			return false;
++		}
++		if (ret < 0) {
++			if (errno == EINTR) {
++				continue;
++			}
++			return false;
++		}
++		if (ret == 0) {
++			idle_ms += 500;
++			if (idle_ms >= NO_FRAME_TIMEOUT_MS) {
++				return true;
++			}
++			continue;
++		}
++
++		if (pfd[0].revents & POLLPRI) {
++			struct v4l2_event ev;
++			bool changed = false;
++			while (xioctl(fd, VIDIOC_DQEVENT, &ev) == 0) {
++				if (ev.type == V4L2_EVENT_SOURCE_CHANGE) {
++					changed = true;
++				}
++			}
++			if (changed && signal_changed(s, fd)) {
++				set_status(s, LOG_INFO, "HDMI signal changed, restarting");
++				return false;
++			}
++		}
++		if (pfd[0].revents & POLLERR) {
++			return false;
++		}
++
++		if (pfd[0].revents & POLLIN) {
++			struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
++			struct v4l2_buffer buf = {
++				.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++				.memory = V4L2_MEMORY_MMAP,
++				.m.planes = planes,
++				.length = num_planes,
++			};
++
++			if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
++				if (errno == EAGAIN) {
++					continue;
++				}
++				return false;
++			}
++			idle_ms = 0;
++
++			pthread_mutex_lock(&s->mutex);
++			if (buf.flags & V4L2_BUF_FLAG_ERROR) {
++				queue_buffer(fd, buf.index, num_planes);
++			} else {
++				/* Drop the previous frame if tick hasn't picked it up yet. */
++				if (s->ready >= 0) {
++					queue_buffer(fd, s->ready, num_planes);
++					s->frames_dropped++;
++				}
++				s->ready = buf.index;
++				s->frames_captured++;
++			}
++			pthread_mutex_unlock(&s->mutex);
++		}
++	}
++	return false;
++}
++
++static void wait_ms(struct hdmirx_source *s, int ms)
++{
++	struct pollfd pfd = {.fd = s->wake_fd, .events = POLLIN};
++	if (!s->stop) {
++		poll(&pfd, 1, ms);
++	}
++}
++
++/* The vendor driver only reprograms the DMA storage format on hotplug. When the
++ * source switches pixel encoding on the fly (e.g. macOS going from 1080p 4:4:4
++ * to 2160p 4:2:0), the DMA keeps writing the old layout, overruns the buffers
++ * and never completes a frame. A soft reset re-runs the hotplug path. */
++static void reset_receiver(struct hdmirx_source *s)
++{
++	uint64_t now = os_gettime_ns();
++	int fd;
++
++	if (s->last_reset_ns && now - s->last_reset_ns < RESET_INTERVAL_NS) {
++		return;
++	}
++	s->last_reset_ns = now;
++
++	fd = open(s->device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++	if (fd < 0 || xioctl(fd, RK_HDMIRX_CMD_SOFT_RESET, (void *)1) < 0) {
++		set_status(s, LOG_WARNING, "Unable to reset the HDMI receiver");
++	} else {
++		set_status(s, LOG_INFO, "Resetting the HDMI receiver");
++	}
++	if (fd >= 0) {
++		close(fd);
++	}
++	wait_ms(s, RESET_SETTLE_MS);
++}
++
++static void *capture_thread(void *data)
++{
++	struct hdmirx_source *s = data;
++
++	os_set_thread_name("rockchip-hdmirx");
++
++	while (!s->stop) {
++		s->format_mismatch = false;
++		if (!stream_setup(s)) {
++			if (s->format_mismatch) {
++				reset_receiver(s);
++			}
++			wait_ms(s, RETRY_MS);
++			continue;
++		}
++		bool stalled = stream_run(s);
++		stream_teardown(s);
++		if (stalled && !s->stop) {
++			set_status(s, LOG_INFO, "No frames from the HDMI receiver, restarting");
++			reset_receiver(s);
++		}
++		wait_ms(s, 100);
++	}
++	return NULL;
++}
++
++static void stop_capture(struct hdmirx_source *s)
++{
++	if (!s->thread_running) {
++		return;
++	}
++	s->stop = true;
++	uint64_t one = 1;
++	if (write(s->wake_fd, &one, sizeof(one)) < 0) {
++		blog_s(s, LOG_WARNING, "Unable to wake capture thread");
++	}
++	pthread_join(s->thread, NULL);
++	s->thread_running = false;
++
++	uint64_t drain;
++	if (read(s->wake_fd, &drain, sizeof(drain)) < 0 && errno != EAGAIN) {
++		blog_s(s, LOG_WARNING, "Unable to reset wake event");
++	}
++}
++
++static void start_capture(struct hdmirx_source *s)
++{
++	s->stop = false;
++	pthread_mutex_lock(&s->mutex);
++	dstr_free(&s->last_status);
++	pthread_mutex_unlock(&s->mutex);
++	if (pthread_create(&s->thread, NULL, capture_thread, s) == 0) {
++		s->thread_running = true;
++	} else {
++		blog_s(s, LOG_ERROR, "Unable to start capture thread");
++	}
++}
++
++/* --- device discovery --------------------------------------------------- */
++
++static bool is_hdmirx(const char *path, struct v4l2_capability *cap)
++{
++	int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++	bool ok;
++
++	if (fd < 0) {
++		return false;
++	}
++	memset(cap, 0, sizeof(*cap));
++	ok = xioctl(fd, VIDIOC_QUERYCAP, cap) == 0 && strstr((const char *)cap->driver, "hdmirx") &&
++	     (cap->device_caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE);
++	close(fd);
++	return ok;
++}
++
++/* Calls cb for every rk_hdmirx node in /dev, in name order. */
++static void for_each_hdmirx(void (*cb)(void *param, const char *path, const struct v4l2_capability *cap), void *param)
++{
++	struct dirent **list;
++	int n = scandir("/dev", &list, NULL, alphasort);
++
++	for (int i = 0; i < n; i++) {
++		if (strncmp(list[i]->d_name, "video", 5) == 0) {
++			struct v4l2_capability cap;
++			struct dstr path = {0};
++			dstr_printf(&path, "/dev/%s", list[i]->d_name);
++			if (is_hdmirx(path.array, &cap)) {
++				cb(param, path.array, &cap);
++			}
++			dstr_free(&path);
++		}
++		free(list[i]);
++	}
++	if (n > 0) {
++		free(list);
++	}
++}
++
++static void first_device_cb(void *param, const char *path, const struct v4l2_capability *cap)
++{
++	UNUSED_PARAMETER(cap);
++	char **out = param;
++	if (!*out) {
++		*out = bstrdup(path);
++	}
++}
++
++static void list_device_cb(void *param, const char *path, const struct v4l2_capability *cap)
++{
++	struct dstr name = {0};
++	dstr_printf(&name, "%s (%s)", (const char *)cap->card, path);
++	obs_property_list_add_string(param, name.array, path);
++	dstr_free(&name);
++}
++
++/* --- obs_source_info ---------------------------------------------------- */
++
++static const char *hdmirx_get_name(void *unused)
++{
++	UNUSED_PARAMETER(unused);
++	return obs_module_text("RockchipHdmiRx");
++}
++
++static void hdmirx_update(void *data, obs_data_t *settings)
++{
++	struct hdmirx_source *s = data;
++	const char *device = obs_data_get_string(settings, "device");
++	char *detected = NULL;
++
++	if (!*device) {
++		for_each_hdmirx(first_device_cb, &detected);
++		device = detected ? detected : "";
++	}
++	if (s->thread_running && s->device && strcmp(s->device, device) == 0) {
++		bfree(detected);
++		return;
++	}
++
++	stop_capture(s);
++	bfree(s->device);
++	s->device = bstrdup(device);
++	bfree(detected);
++	start_capture(s);
++}
++
++static void *hdmirx_create(obs_data_t *settings, obs_source_t *source)
++{
++	struct hdmirx_source *s = bzalloc(sizeof(*s));
++	char *effect_path;
++
++	s->source = source;
++	s->fd = -1;
++	s->ready = s->displayed = -1;
++	pthread_mutex_init(&s->mutex, NULL);
++
++	s->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++	if (s->wake_fd < 0) {
++		blog_s(s, LOG_ERROR, "eventfd: %s", strerror(errno));
++		pthread_mutex_destroy(&s->mutex);
++		bfree(s);
++		return NULL;
++	}
++
++	effect_path = obs_module_file("hdmirx.effect");
++	obs_enter_graphics();
++	s->effect = gs_effect_create_from_file(effect_path, NULL);
++	obs_leave_graphics();
++	bfree(effect_path);
++	if (!s->effect) {
++		blog_s(s, LOG_ERROR, "Unable to load hdmirx.effect");
++	}
++
++	hdmirx_update(s, settings);
++	return s;
++}
++
++static void hdmirx_destroy(void *data)
++{
++	struct hdmirx_source *s = data;
++
++	stop_capture(s);
++	stream_teardown(s);
++
++	obs_enter_graphics();
++	gs_effect_destroy(s->effect);
++	obs_leave_graphics();
++
++	close(s->wake_fd);
++	pthread_mutex_destroy(&s->mutex);
++	dstr_free(&s->last_status);
++	bfree(s->device);
++	bfree(s);
++}
++
++static void hdmirx_tick(void *data, float seconds)
++{
++	struct hdmirx_source *s = data;
++	UNUSED_PARAMETER(seconds);
++
++	pthread_mutex_lock(&s->mutex);
++	if (s->fd >= 0) {
++		for (uint32_t i = 0; i < s->num_buffers; i++) {
++			struct hdmirx_buffer *b = &s->buffers[i];
++			if (b->retire_age >= 0 && ++b->retire_age > RETIRE_TICKS) {
++				b->retire_age = -1;
++				queue_buffer(s->fd, i, s->layout.v4l2_planes);
++			}
++		}
++		if (s->ready >= 0) {
++			if (s->displayed >= 0) {
++				s->buffers[s->displayed].retire_age = 0;
++			}
++			s->displayed = s->ready;
++			s->ready = -1;
++		}
++	}
++	pthread_mutex_unlock(&s->mutex);
++}
++
++static bool import_buffer(struct hdmirx_source *s, struct hdmirx_buffer *b)
++{
++	static const uint64_t linear = 0; /* DRM_FORMAT_MOD_LINEAR */
++
++	for (uint32_t p = 0; p < s->layout.gpu_planes; p++) {
++		const struct gpu_plane *gp = &s->layout.plane[p];
++		int fd = b->dmabuf[gp->v4l2_plane];
++
++		b->tex[p] = gs_texture_create_from_dmabuf(gp->width, gp->height, gp->drm_format, gp->gs_format, 1, &fd,
++							  &gp->pitch, &gp->offset, &linear);
++		if (!b->tex[p]) {
++			char fourcc[5];
++			blog_s(s, LOG_ERROR, "Unable to import plane %u (%s %ux%u pitch %u) as a GPU texture", p,
++			       fourcc_name(gp->drm_format, fourcc), gp->width, gp->height, gp->pitch);
++			return false;
++		}
++	}
++	return true;
++}
++
++static void draw_buffer(struct hdmirx_source *s, struct hdmirx_buffer *b)
++{
++	struct vec2 size;
++
++	vec2_set(&size, (float)s->layout.width, (float)s->layout.height);
++	gs_effect_set_texture(gs_effect_get_param_by_name(s->effect, "image"), b->tex[0]);
++	gs_effect_set_texture(gs_effect_get_param_by_name(s->effect, "image1"), b->tex[1]);
++	gs_effect_set_val(gs_effect_get_param_by_name(s->effect, "color_matrix"), s->color_matrix,
++			  sizeof(s->color_matrix));
++	gs_effect_set_val(gs_effect_get_param_by_name(s->effect, "color_range_min"), s->color_range_min,
++			  sizeof(s->color_range_min));
++	gs_effect_set_val(gs_effect_get_param_by_name(s->effect, "color_range_max"), s->color_range_max,
++			  sizeof(s->color_range_max));
++	gs_effect_set_vec2(gs_effect_get_param_by_name(s->effect, "frame_size"), &size);
++
++	while (gs_effect_loop(s->effect, s->layout.technique)) {
++		gs_draw_sprite(b->tex[0], 0, s->layout.width, s->layout.height);
++	}
++}
++
++static void hdmirx_render(void *data, gs_effect_t *unused)
++{
++	struct hdmirx_source *s = data;
++	UNUSED_PARAMETER(unused);
++
++	if (!s->effect) {
++		return;
++	}
++
++	pthread_mutex_lock(&s->mutex);
++	if (s->displayed >= 0 && !s->import_failed) {
++		struct hdmirx_buffer *b = &s->buffers[s->displayed];
++		if (b->tex[0] || import_buffer(s, b)) {
++			draw_buffer(s, b);
++		} else {
++			s->import_failed = true;
++		}
++	}
++	pthread_mutex_unlock(&s->mutex);
++}
++
++static uint32_t hdmirx_get_width(void *data)
++{
++	struct hdmirx_source *s = data;
++	pthread_mutex_lock(&s->mutex);
++	uint32_t width = s->displayed >= 0 ? s->layout.width : 0;
++	pthread_mutex_unlock(&s->mutex);
++	return width;
++}
++
++static uint32_t hdmirx_get_height(void *data)
++{
++	struct hdmirx_source *s = data;
++	pthread_mutex_lock(&s->mutex);
++	uint32_t height = s->displayed >= 0 ? s->layout.height : 0;
++	pthread_mutex_unlock(&s->mutex);
++	return height;
++}
++
++static void add_info(obs_properties_t *props, const char *name, const char *label, const char *value,
++		     enum obs_text_info_type type)
++{
++	struct dstr text = {0};
++	obs_property_t *p;
++
++	dstr_printf(&text, "%s: %s", label, value);
++	p = obs_properties_add_text(props, name, text.array, OBS_TEXT_INFO);
++	obs_property_text_set_info_type(p, type);
++	dstr_free(&text);
++}
++
++static void add_signal_info(struct hdmirx_source *s, obs_properties_t *props)
++{
++	struct dstr value = {0};
++	char fourcc[5];
++
++	pthread_mutex_lock(&s->mutex);
++	if (s->fd < 0) {
++		const char *status = s->last_status.array ? s->last_status.array : obs_module_text("Starting");
++		add_info(props, "status", obs_module_text("Status"), status,
++			 s->last_status_level == LOG_WARNING ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
++		pthread_mutex_unlock(&s->mutex);
++		return;
++	}
++
++	const struct v4l2_bt_timings *bt = &s->timings;
++	const char *desc = fourcc_description(s->layout.fourcc);
++	bool rgb = s->layout.fourcc == V4L2_PIX_FMT_BGR24;
++
++	add_info(props, "status", obs_module_text("Status"), obs_module_text("Capturing"), OBS_TEXT_INFO_NORMAL);
++
++	dstr_printf(&value, "%ux%u%s", s->layout.width, s->layout.height, bt->interlaced ? "i" : "p");
++	add_info(props, "resolution", obs_module_text("Resolution"), value.array, OBS_TEXT_INFO_NORMAL);
++
++	dstr_printf(&value, "%.2f Hz", timings_fps(bt));
++	add_info(props, "fps", obs_module_text("FrameRate"), value.array, OBS_TEXT_INFO_NORMAL);
++
++	dstr_printf(&value, "%.2f MHz", (double)bt->pixelclock / 1e6);
++	add_info(props, "pixelclock", obs_module_text("PixelClock"), value.array, OBS_TEXT_INFO_NORMAL);
++
++	dstr_copy(&value, fourcc_name(s->layout.fourcc, fourcc));
++	if (desc) {
++		dstr_catf(&value, " (%s)", desc);
++	}
++	add_info(props, "format", obs_module_text("PixelFormat"), value.array, OBS_TEXT_INFO_NORMAL);
++
++	const char *matrix = s->colorspace == VIDEO_CS_601 ? "Rec. 601" : "Rec. 709";
++	dstr_printf(&value, "%s, %s", rgb ? "RGB" : matrix,
++		    obs_module_text(s->range == VIDEO_RANGE_FULL ? "FullRange" : "LimitedRange"));
++	add_info(props, "color", obs_module_text("Color"), value.array, OBS_TEXT_INFO_NORMAL);
++
++	/* Frames never pass through the CPU or RGA: the GPU samples the capture
++	 * buffers directly and converts them in hdmirx.effect. */
++	dstr_printf(&value, "%s, GPU shader, zero-copy (no CPU copy, no RGA)", rgb ? "BGR → RGB" : "YCbCr → RGB");
++	add_info(props, "conversion", obs_module_text("Conversion"), value.array, OBS_TEXT_INFO_NORMAL);
++
++	dstr_free(&value);
++	for (uint32_t p = 0; p < s->layout.gpu_planes; p++) {
++		const struct gpu_plane *gp = &s->layout.plane[p];
++		dstr_catf(&value, "%s%s %ux%u", p ? " + " : "", gp->drm_format == DRM_FORMAT_R8 ? "R8" : "GR88",
++			  gp->width, gp->height);
++	}
++	enum obs_text_info_type import_type = OBS_TEXT_INFO_NORMAL;
++	if (s->import_failed) {
++		dstr_catf(&value, ", %s", obs_module_text("ImportFailed"));
++		import_type = OBS_TEXT_INFO_ERROR;
++	} else if (s->displayed >= 0 && s->buffers[s->displayed].tex[0]) {
++		dstr_cat(&value, ", dma-buf (linear)");
++	} else {
++		dstr_catf(&value, ", %s", obs_module_text("WaitingForFrame"));
++	}
++	add_info(props, "textures", obs_module_text("GpuTextures"), value.array, import_type);
++
++	dstr_printf(&value, "%" PRIu64 " %s, %" PRIu64 " %s", s->frames_captured, obs_module_text("Captured"),
++		    s->frames_dropped, obs_module_text("Dropped"));
++	add_info(props, "frames", obs_module_text("Frames"), value.array, OBS_TEXT_INFO_NORMAL);
++	pthread_mutex_unlock(&s->mutex);
++
++	dstr_free(&value);
++}
++
++static bool refresh_clicked(obs_properties_t *props, obs_property_t *p, void *data)
++{
++	UNUSED_PARAMETER(props);
++	UNUSED_PARAMETER(p);
++	UNUSED_PARAMETER(data);
++	return true; /* reload the properties */
++}
++
++static obs_properties_t *hdmirx_properties(void *data)
++{
++	struct hdmirx_source *s = data;
++	obs_properties_t *props = obs_properties_create();
++	obs_property_t *list = obs_properties_add_list(props, "device", obs_module_text("Device"), OBS_COMBO_TYPE_LIST,
++						       OBS_COMBO_FORMAT_STRING);
++
++	for_each_hdmirx(list_device_cb, list);
++	if (obs_property_list_item_count(list) == 0) {
++		obs_property_list_add_string(list, obs_module_text("NoDevice"), "");
++	}
++
++	if (s) {
++		add_signal_info(s, props);
++		obs_properties_add_button2(props, "refresh", obs_module_text("Refresh"), refresh_clicked, s);
++	}
++	return props;
++}
++
++static struct obs_source_info hdmirx_source_info = {
++	.id = "rockchip_hdmirx_source",
++	.type = OBS_SOURCE_TYPE_INPUT,
++	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_DO_NOT_DUPLICATE,
++	.get_name = hdmirx_get_name,
++	.create = hdmirx_create,
++	.destroy = hdmirx_destroy,
++	.update = hdmirx_update,
++	.get_properties = hdmirx_properties,
++	.video_tick = hdmirx_tick,
++	.video_render = hdmirx_render,
++	.get_width = hdmirx_get_width,
++	.get_height = hdmirx_get_height,
++	.icon_type = OBS_ICON_TYPE_CAMERA,
++};
++
++bool obs_module_load(void)
++{
++	obs_register_source(&hdmirx_source_info);
++	return true;
++}

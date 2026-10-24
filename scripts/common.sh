@@ -56,6 +56,19 @@ resolve_versions() {
   export OBS_VERSION JF_VERSION
 }
 
+# Patch folder for an OBS version: patches/obs-studio/<version>/ holds the patch
+# series refreshed against that release, and is used for every release up to the
+# next folder. Picks the highest folder version <= $1.
+obs_patch_dir() {
+  local dir="$REPO_ROOT/patches/obs-studio" picked="" v
+  for v in $(ls "$dir" | sort -V); do
+    [[ -d "$dir/$v" ]] || continue
+    [[ "$(printf '%s\n' "$v" "$1" | sort -V | head -n 1)" == "$v" ]] && picked="$v"
+  done
+  [[ -n "$picked" ]] || die "no patches for OBS $1 in $dir"
+  echo "$dir/$picked"
+}
+
 # Shallow clone of a tag/branch into $SRC_DIR/<name>, reusing an existing checkout.
 fetch_git() {
   local name="$1" repo="$2" ref="$3"; shift 3

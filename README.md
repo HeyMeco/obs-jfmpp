@@ -161,9 +161,12 @@ Notes:
 
 ## Patches and CEF
 
-`patches/obs-studio/*.patch` are applied with `git apply` on top of the OBS release tag. If a
-new OBS release changes the code they touch, the build fails at "Apply patches" and the
-patches need refreshing against the new tag.
+`patches/obs-studio/<version>/*.patch` are applied with `git apply` on top of the OBS release
+tag. Each folder holds the patch series refreshed against that OBS release, and the build uses
+the folder with the highest version that is not newer than the OBS being built: 33.0.1 uses
+`33.0.0/`, 32.2.3 uses `32.2.2/`. If a new OBS release changes the code the patches touch, the
+build fails at "Apply patches"; refresh the series against the new tag into a new folder named
+after it, and keep the old folder so older releases still build.
 
 CEF follows the OBS release: the build reads the CEF version, revision and SHA-256 for
 `ubuntu-aarch64` from that release's `CMakePresets.json`, so obs-browser and CEF always match.
@@ -189,6 +192,6 @@ The `.deb` lands in `out/`. Inside a Trixie/Resolute arm64 system or container y
 |--------|------|
 | `scripts/install-deps.sh` | apt build dependencies (no distro `libav*-dev`) |
 | `scripts/build-ffmpeg.sh` | Rockchip MPP + RGA, then jellyfin-ffmpeg with its patch series applied |
-| `scripts/build-obs.sh` | applies `patches/obs-studio`, fetches and verifies CEF, builds OBS Studio against that FFmpeg, staged install |
+| `scripts/build-obs.sh` | applies `patches/obs-studio/<version>`, fetches and verifies CEF, builds OBS Studio against that FFmpeg, staged install |
 | `scripts/package-deb.sh` | bundles FFmpeg, computes `Depends` with `dpkg-shlibdeps`, builds the `.deb` |
 | `scripts/test-deb.sh` | installs the `.deb` and checks the rkmpp codecs and library resolution |

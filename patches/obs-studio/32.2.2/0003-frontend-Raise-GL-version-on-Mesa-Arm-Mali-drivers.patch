@@ -1,0 +1,86 @@
+diff --git a/frontend/obs-main.cpp b/frontend/obs-main.cpp
+index df0ec63..129643b 100644
+--- a/frontend/obs-main.cpp
++++ b/frontend/obs-main.cpp
+@@ -41,6 +41,14 @@
+ #include <fstream>
+ #include <iostream>
+ #include <sstream>
++#ifdef __linux__
++#include <glob.h>
++#include <unistd.h>
++
++#include <climits>
++#include <cstdlib>
++#include <cstring>
++#endif
+ #ifdef _WIN32
+ #include <shellapi.h>
+ #define WIN32_LEAN_AND_MEAN
+@@ -485,6 +493,42 @@ QAccessibleInterface *accessibleFactory(const QString &classname, QObject *objec
+ }
+ 
+ static const char *run_program_init = "run_program_init";
++#ifdef __linux__
++/* Name of the Mesa Arm Mali driver we raised the GL version for, if any. */
++static const char *mesaMaliGlOverride = nullptr;
++
++/* Mesa's Panthor/Panfrost drivers (Arm Mali, e.g. Rockchip RK3588) don't advertise
++ * the OpenGL 3.3 core profile OBS requires, but run OBS fine when told to. Must run
++ * before any GL context is created; user-set values are left alone. */
++static void apply_mesa_mali_gl_override()
++{
++	glob_t drivers;
++	if (glob("/sys/class/drm/card*/device/driver", 0, nullptr, &drivers) != 0)
++		return;
++
++	for (size_t i = 0; i < drivers.gl_pathc && !mesaMaliGlOverride; i++) {
++		char target[PATH_MAX];
++		ssize_t len = readlink(drivers.gl_pathv[i], target, sizeof(target) - 1);
++		if (len <= 0)
++			continue;
++		target[len] = '\0';
++
++		const char *name = strrchr(target, '/');
++		name = name ? name + 1 : target;
++		if (strcmp(name, "panthor") == 0)
++			mesaMaliGlOverride = "panthor";
++		else if (strcmp(name, "panfrost") == 0)
++			mesaMaliGlOverride = "panfrost";
++	}
++	globfree(&drivers);
++
++	if (mesaMaliGlOverride) {
++		setenv("MESA_GL_VERSION_OVERRIDE", "3.3", 0);
++		setenv("MESA_GLSL_VERSION_OVERRIDE", "330", 0);
++	}
++}
++#endif
++
+ static int run_program(fstream &logFile, int argc, char *argv[])
+ {
+ 	int ret = -1;
+@@ -618,6 +662,12 @@ static int run_program(fstream &logFile, int argc, char *argv[])
+ 			create_log_file(logFile);
+ 		}
+ 
++#ifdef __linux__
++		if (mesaMaliGlOverride)
++			blog(LOG_INFO, "Mesa %s (Arm Mali) detected: MESA_GL_VERSION_OVERRIDE=%s MESA_GLSL_VERSION_OVERRIDE=%s",
++			     mesaMaliGlOverride, getenv("MESA_GL_VERSION_OVERRIDE"), getenv("MESA_GLSL_VERSION_OVERRIDE"));
++#endif
++
+ 		program.checkForUncleanShutdown();
+ 
+ 		qInstallMessageHandler([](QtMsgType type, const QMessageLogContext &, const QString &message) {
+@@ -882,6 +932,10 @@ static void set_process_mitigation_policies()
+ 
+ int main(int argc, char *argv[])
+ {
++#ifdef __linux__
++	apply_mesa_mali_gl_override();
++#endif
++
+ #ifndef _WIN32
+ 	using SignalHandlerCallback = decltype(OBSApp::sigIntSignalHandler);
+ 

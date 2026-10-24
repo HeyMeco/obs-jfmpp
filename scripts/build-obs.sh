@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build OBS Studio (with the patches in patches/obs-studio and the CEF build
+# Build OBS Studio (with the patches in patches/obs-studio/<version> and the CEF build
 # OBS pins for this release) against the jellyfin-ffmpeg in $FFMPEG_PREFIX, and
 # install it into the staging root $WORK_DIR/pkg/debian/obs-studio.
 #
@@ -8,18 +8,19 @@ source "$(dirname "$0")/common.sh"
 resolve_versions
 
 [[ -f "$FFMPEG_PREFIX/lib/pkgconfig/libavcodec.pc" ]] || die "run build-ffmpeg.sh first"
+PATCH_DIR="$(obs_patch_dir "$OBS_VERSION")"
 
 group "Fetch OBS Studio $OBS_VERSION"
 fetch_git obs-studio https://github.com/obsproject/obs-studio.git "$OBS_VERSION" \
   --recurse-submodules --shallow-submodules
 endgroup
 
-group "Apply patches"
+group "Apply patches from patches/obs-studio/$(basename "$PATCH_DIR")"
 OBS_SRC="$SRC_DIR/obs-studio"
 # Start from a pristine tree so re-runs (and patch updates) apply cleanly.
 git -C "$OBS_SRC" reset -q --hard HEAD
 git -C "$OBS_SRC" clean -qfd
-for patch in "$REPO_ROOT"/patches/obs-studio/*.patch; do
+for patch in "$PATCH_DIR"/*.patch; do
   echo "$(basename "$patch")"
   git -C "$OBS_SRC" apply --whitespace=nowarn "$patch" \
     || die "$(basename "$patch") does not apply to OBS $OBS_VERSION; refresh it"
