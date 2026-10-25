@@ -192,8 +192,13 @@ jobs:
           |------|--------|
           $(for f in *.deb; do d="${f%_arm64.deb}"; echo "| \`$f\` | ${d##*_} |"; done)
 
-          Install with \`sudo apt install ./obs-studio_*_<distro>_arm64.deb\`.
+          Install with \`sudo apt install ./obs-studio-rockchip_*_<distro>_arm64.deb\`.
           EOF
+
+          # Copies under version-less names, so .../releases/latest/download/obs-studio-rockchip_<distro>_arm64.deb
+          # always fetches the newest package. Armbian's apt repo syncs from these (armbian/os external/).
+          mkdir unversioned
+          for f in *.deb; do d="${f%_arm64.deb}"; cp "$f" "unversioned/obs-studio-rockchip_${d##*_}_arm64.deb"; done
 
           title="OBS Studio $OBS + jellyfin-ffmpeg $JF"
 
@@ -217,4 +222,4 @@ jobs:
             --title "$title" \
             --notes-file notes.md \
             --latest="$latest" \
-            *.deb SHA256SUMS
+            *.deb unversioned/*.deb SHA256SUMS

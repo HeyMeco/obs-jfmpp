@@ -1,6 +1,0 @@
-# Installed by the obs-jfmpp obs-studio package and removed with it. Keeps apt
-# from replacing this build with a newer obs-studio from a distribution repo,
-# which lacks the Rockchip MPP encoders and HDMI input.
-Package: obs-studio
-Pin: version /\+jf/
-Pin-Priority: 1001

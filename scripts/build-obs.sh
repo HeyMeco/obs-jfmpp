@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build OBS Studio (with the patches in patches/obs-studio/<version> and the CEF build
 # OBS pins for this release) against the jellyfin-ffmpeg in $FFMPEG_PREFIX, and
-# install it into the staging root $WORK_DIR/pkg/debian/obs-studio.
+# install it into the staging root $WORK_DIR/pkg/debian/obs-studio-rockchip.
 #
 # Env: CEF_VERSION / CEF_REVISION / CEF_SHA256 override the pinned CEF build.
 source "$(dirname "$0")/common.sh"
@@ -109,7 +109,7 @@ cmake --build "$WORK_DIR/obs" -j "$JOBS"
 endgroup
 
 group "Install OBS Studio into staging root"
-STAGE="$WORK_DIR/pkg/debian/obs-studio"
+STAGE="$WORK_DIR/pkg/debian/obs-studio-rockchip"
 rm -rf "$WORK_DIR/pkg"
 DESTDIR="$STAGE" cmake --install "$WORK_DIR/obs" --strip
 endgroup

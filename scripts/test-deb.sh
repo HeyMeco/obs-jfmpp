@@ -3,7 +3,7 @@
 # Meant for a fresh, throwaway container (run as root).
 source "$(dirname "$0")/common.sh"
 
-deb="${1:-$(ls "$OUT_DIR"/obs-studio_*.deb | head -n1)}"
+deb="${1:-$(ls "$OUT_DIR"/obs-studio-rockchip_*.deb | head -n1)}"
 [[ -f "$deb" ]] || die "no .deb found"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -63,11 +63,7 @@ ldd "$plugins/obs-ffmpeg.so" | grep -E 'libavcodec|rockchip_mpp|librga' || true
 QT_QPA_PLATFORM=offscreen obs --version
 QT_QPA_PLATFORM=offscreen obs --help >/dev/null
 [[ -f /usr/lib/udev/rules.d/70-obs-jfmpp-rockchip.rules ]] || die "udev rule missing"
-[[ -f /usr/share/doc/obs-studio/copyright ]] || die "copyright file missing"
+[[ -f /usr/share/doc/obs-studio-rockchip/copyright ]] || die "copyright file missing"
 if grep -q -- '-Werror' /usr/lib/*/pkgconfig/libobs.pc; then die "libobs.pc still has -Werror"; fi
-# Not piped straight into grep -q: apt-cache would die of SIGPIPE, failing under pipefail.
-policy="$(apt-cache policy obs-studio)"
-grep -qE '^ \*\*\* .*\+jf.* 1001$' <<<"$policy" || die "apt pin doesn't hold the installed obs-studio"
-apt-get remove -y obs-studio >/dev/null
-[[ ! -e /etc/apt/preferences.d/obs-jfmpp ]] || die "apt pin left behind after remove"
+apt-get remove -y obs-studio-rockchip >/dev/null
 log "Smoke test passed"

@@ -1,5 +1,5 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: obs-studio (obs-jfmpp build)
+Upstream-Name: obs-studio (obs-jfmpp build, packaged as obs-studio-rockchip)
 Source: https://github.com/obsproject/obs-studio
 Comment:
  This binary package combines the components below. Because jellyfin-ffmpeg is
@@ -21,7 +21,7 @@ License: GPL-3+
 Files: usr/lib/obs-jellyfin-ffmpeg/lib/librockchip_*
 Copyright: Rockchip Electronics Co., Ltd.
 Comment: Rockchip MPP, from https://github.com/nyanmisaka/rk-mirrors (jellyfin-mpp-next).
- License texts are in /usr/share/doc/obs-studio/rockchip-mpp/.
+ License texts are in /usr/share/doc/obs-studio-rockchip/rockchip-mpp/.
 License: Apache-2.0 and MIT
 
 Files: usr/lib/obs-jellyfin-ffmpeg/lib/librga*
@@ -35,7 +35,7 @@ Comment: Rockchip camera 3A engine (rkaiq) and RK3588 sensor tuning files, from
  https://github.com/mixtile-rockchip/mixtile-sdk-linux-external-camera_engine_rkaiq
  (linux-6.1-stan-rkr7) with the patches in patches/rkaiq. Its exposure and
  white balance algorithms are linked from Rockchip's prebuilt static libraries.
- See /usr/share/doc/obs-studio/NOTICE.rkaiq.
+ See /usr/share/doc/obs-studio-rockchip/NOTICE.rkaiq.
 License: Apache-2.0
 
 Files: usr/lib/*/obs-plugins/libcef.so usr/lib/*/obs-plugins/libEGL.so
@@ -51,7 +51,7 @@ Files: usr/lib/*/obs-plugins/libcef.so usr/lib/*/obs-plugins/libEGL.so
 Copyright: 2008-2026 Marshall A. Greenblatt; 2006-2026 The Chromium Authors
 Comment: Chromium Embedded Framework binary distribution from
  https://cdn-fastly.obsproject.com/downloads/. See
- /usr/share/doc/obs-studio/LICENSE.cef; Chromium's third-party licenses are
+ /usr/share/doc/obs-studio-rockchip/LICENSE.cef; Chromium's third-party licenses are
  listed at chrome://credits.
 License: BSD-3-clause
 
@@ -68,7 +68,7 @@ License: Apache-2.0
  in "/usr/share/common-licenses/Apache-2.0".
 
 License: MIT
- See /usr/share/doc/obs-studio/rockchip-mpp/MIT.
+ See /usr/share/doc/obs-studio-rockchip/rockchip-mpp/MIT.
 
 License: BSD-3-clause
- See /usr/share/doc/obs-studio/LICENSE.cef.
+ See /usr/share/doc/obs-studio-rockchip/LICENSE.cef.
