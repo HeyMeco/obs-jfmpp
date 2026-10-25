@@ -4,7 +4,7 @@ source "$(dirname "$0")/common.sh"
 resolve_versions
 
 PKG_DIR="$WORK_DIR/pkg"
-STAGE="$PKG_DIR/debian/obs-studio"
+STAGE="$PKG_DIR/debian/obs-studio-rockchip"
 [[ -x "$STAGE/usr/bin/obs" ]] || die "run build-obs.sh first"
 
 ARCH="$(deb_arch)"
@@ -31,7 +31,7 @@ find "$STAGE" -type f -name '*.pc' -exec \
   sed -e 's| -fPIC | |g' -e 's| -fvisibility=hidden | |g' -e 's/ -Werror\b//' -i {} +
 find "$STAGE" -type f -name '*.pem' -exec chmod a-x {} +
 
-DOC="$STAGE/usr/share/doc/obs-studio"
+DOC="$STAGE/usr/share/doc/obs-studio-rockchip"
 mkdir -p "$DOC/rockchip-mpp"
 source_url="${GITHUB_REPOSITORY:+https://github.com/$GITHUB_REPOSITORY}"
 : "${source_url:=the obs-jfmpp build repository}"
@@ -50,11 +50,6 @@ endgroup
 group "Leave the HDMI-in audio card to OBS (WirePlumber)"
 install -Dm644 "$REPO_ROOT/packaging/wireplumber-hdmiin.conf" \
   "$STAGE/usr/share/wireplumber/wireplumber.conf.d/50-obs-jfmpp-hdmiin.conf"
-endgroup
-
-group "Keep apt from replacing this build"
-# Not listed as a conffile, so dpkg deletes it on remove, not just on purge.
-install -Dm644 "$REPO_ROOT/packaging/apt-preferences" "$STAGE/etc/apt/preferences.d/obs-jfmpp"
 endgroup
 
 mapfile -t elfs < <(find "$STAGE" -type f -exec file -N {} + | awk -F: '/ELF/ {print $1}')
@@ -84,9 +79,9 @@ endgroup
 group "Compute dependencies"
 mkdir -p "$PKG_DIR/debian"
 cat > "$PKG_DIR/debian/control" <<CTRL
-Source: obs-studio
+Source: obs-studio-rockchip
 
-Package: obs-studio
+Package: obs-studio-rockchip
 Architecture: $ARCH
 CTRL
 (
@@ -101,12 +96,12 @@ shlibs="$(sed -n 's/^shlibs:Depends=//p' "$PKG_DIR/substvars")"
 [[ -n "$shlibs" ]] || die "dpkg-shlibdeps produced no dependencies"
 endgroup
 
-group "Build obs-studio $DEB_VERSION"
+group "Build obs-studio-rockchip $DEB_VERSION"
 installed_size="$(du -sk --exclude=DEBIAN "$STAGE" | cut -f1)"
 mkdir -p "$STAGE/DEBIAN"
 install -m755 "$REPO_ROOT/packaging/postinst" "$REPO_ROOT/packaging/postrm" "$STAGE/DEBIAN/"
 cat > "$STAGE/DEBIAN/control" <<CTRL
-Package: obs-studio
+Package: obs-studio-rockchip
 Version: $DEB_VERSION
 Architecture: $ARCH
 Maintainer: obs-jfmpp <noreply@github.com>
@@ -114,12 +109,13 @@ Installed-Size: $installed_size
 Depends: $shlibs, qt6-qpa-plugins, qt6-svg-plugins, qt6-wayland, qt6-image-formats-plugins
 Recommends: vlc-plugin-base
 Suggests: pkexec | polkitd, v4l2loopback-dkms
-Conflicts: libobs0, libobs0t64, libobs-dev, obs-plugins, obs-studio-common
-Replaces: libobs0, libobs0t64, libobs-dev, obs-plugins, obs-studio-common
+Provides: obs-studio (= $DEB_VERSION)
+Conflicts: obs-studio, libobs0, libobs0t64, libobs-dev, obs-plugins, obs-studio-common
+Replaces: obs-studio, libobs0, libobs0t64, libobs-dev, obs-plugins, obs-studio-common
 Section: video
 Priority: optional
 Homepage: https://obsproject.com/
-Description: OBS Studio built against jellyfin-ffmpeg with Rockchip MPP
+Description: OBS Studio for Rockchip SoCs, with MPP/RGA via jellyfin-ffmpeg
  OBS Studio $OBS_VERSION linked against a private copy of jellyfin-ffmpeg
  $JF_VERSION (installed in $FFMPEG_PREFIX) built with --enable-rkmpp and
  --enable-rkrga. Adds native "Rockchip MPP H.264/HEVC" encoders to OBS's
@@ -129,7 +125,7 @@ Description: OBS Studio built against jellyfin-ffmpeg with Rockchip MPP
 CTRL
 
 mkdir -p "$OUT_DIR"
-DEB="$OUT_DIR/obs-studio_${OBS_VERSION}-jf${JF_PLAIN}_${CODENAME}_${ARCH}.deb"
+DEB="$OUT_DIR/obs-studio-rockchip_${OBS_VERSION}-jf${JF_PLAIN}_${CODENAME}_${ARCH}.deb"
 dpkg-deb --root-owner-group -Zxz --build "$STAGE" "$DEB"
 dpkg-deb --info "$DEB"
 endgroup

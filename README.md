@@ -16,12 +16,14 @@ Prebuilt packages are on the [Releases](../../releases) page.
 ## Install
 
 ```sh
-sudo apt install ./obs-studio_<obs>-jf<jellyfin-ffmpeg>_<trixie|resolute>_arm64.deb
+sudo apt install ./obs-studio-rockchip_<obs>-jf<jellyfin-ffmpeg>_<trixie|resolute>_arm64.deb
 ```
 
-The package is named `obs-studio` and replaces the distro's `obs-studio`, `obs-studio-common`,
-`libobs0t64`, `obs-plugins` and `libobs-dev`. apt removes those automatically. This was tested
-over Trixie's OBS 30.2.3 and Resolute's OBS 32.1.0.
+The package is named `obs-studio-rockchip`. It provides `obs-studio` and replaces the distro's
+`obs-studio`, `obs-studio-common`, `libobs0t64`, `obs-plugins` and `libobs-dev`. apt removes those
+automatically. This was tested over Trixie's OBS 30.2.3 and Resolute's OBS 32.1.0. Because the name
+differs, `apt upgrade` never swaps it for the distro's OBS or the other way round. Older obs-jfmpp
+releases named the package `obs-studio`; installing `obs-studio-rockchip` replaces it the same way.
 
 ### Packaging
 
@@ -30,7 +32,7 @@ where it matters at runtime. That means the same runtime `Depends` (`qt6-svg-plu
 `qt6-wayland`, `qt6-image-formats-plugins`), `Suggests: pkexec | polkitd, v4l2loopback-dkms`,
 and its install-time clean-ups: build-only flags such as `-Werror` are stripped from the `.pc`
 files, and `.pem` files lose the executable bit. It also ships a DEP-5
-`/usr/share/doc/obs-studio/copyright` covering OBS, jellyfin-ffmpeg, Rockchip MPP/RGA and CEF.
+`/usr/share/doc/obs-studio-rockchip/copyright` covering OBS, jellyfin-ffmpeg, Rockchip MPP/RGA and CEF.
 
 It deliberately stays a single package, unlike Debian's five-way split. It also skips
 Debian-policy-only patches (soname 0, hidden symbols, `obs-ffmpeg-mux` under `/usr/lib`).
@@ -95,11 +97,6 @@ kernels often restrict both to `root`. The package therefore installs
 `/usr/lib/udev/rules.d/70-obs-jfmpp-rockchip.rules`, which gives these nodes and `/dev/rga`
 to the `video` group and, through `uaccess`, to the user logged in at the desktop. The rule
 is applied on install.
-
-The package also installs `/etc/apt/preferences.d/obs-jfmpp`, which pins `obs-studio` to
-versions containing `+jf` (priority 1001) so `apt upgrade` doesn't replace it with a newer distribution
-build (without the Rockchip encoders, HDMI input and camera source). Newer obs-jfmpp packages still install
-over it, and removing the package removes the pin.
 
 #### Troubleshooting "Failed to init MPP context: -1"
 

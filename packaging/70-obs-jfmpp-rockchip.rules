@@ -1,4 +1,4 @@
-# Installed by obs-studio (obs-jfmpp): access to the Rockchip hardware encoder.
+# Installed by obs-studio-rockchip (obs-jfmpp): access to the Rockchip hardware encoder.
 #
 # Rockchip MPP opens its service node read-write and allocates frame buffers from
 # the DMA heaps; RGA does colour conversion. Give these to the "video" group and,
