@@ -150,16 +150,19 @@ always uses the two RGA3 cores.
   reconnected, the source restarts by itself; while there is no signal it is empty.
 - The source's Properties window shows the signal: resolution, frame rate, pixel clock,
   pixel format, colorimetry and range, whether it is HDR, the receiver's EDID, the conversion path (including the RGA3 time per frame
-  for 10-bit signals), the GPU textures, and the frame counts. *Dropped* counts frames lost
-  although OBS could have shown them, *skipped* counts frames left out because the signal runs
-  faster than the OBS frame rate (e.g. 120 Hz into a 60 FPS canvas). Frames OBS itself misses
-  to rendering lag show up in OBS's stats, not here. Without a
+  for 10-bit signals), the GPU textures, how long it has been capturing, and the dropped
+  frames in the last minute and in total (with the share of all frames). *Dropped* counts
+  frames lost although OBS could have shown them; frames left out because the signal runs
+  faster than the OBS frame rate (e.g. 120 Hz into a 60 FPS canvas) are listed separately as
+  *skipped*. Frames OBS itself misses to rendering lag show up in OBS's stats, not here. Without a
   signal it shows why, e.g. *No HDMI signal*. It updates by itself when the signal changes;
-  **Refresh** updates the frame and timing counts. **Disconnect** stops capturing and
+  **Refresh** updates the capture time, frame counts and timings. **Disconnect** stops capturing and
   closes the receiver's video and audio devices so other programs can use them, until
   **Connect** (or restarting OBS).
 - The OBS log shows the detected signal, e.g. `Capturing 1920x1080p @ 60.00 Hz, NV24, 8
-  buffers`, and a frame count when capture stops.
+  buffers`, a line every 10 s while frames are being dropped (e.g. `3 frames dropped in the
+  last 10 s (5 in total)`), so drops can be matched to a point in a recording, and the
+  capture time and frame counts when capture stops.
 - Up to 3840x2160p60. Sources usually send 4K60 as YCbCr 4:2:0 (`NV12`).
 - The vendor driver only reprograms its DMA for a new pixel encoding on hotplug. When a
   source switches encoding without replugging (macOS going from 1080p 4:4:4 to 4K 4:2:0,

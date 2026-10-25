@@ -184,10 +184,10 @@ index 0000000..e41bbe4
 +}
 diff --git a/plugins/rockchip-hdmirx/data/locale/en-US.ini b/plugins/rockchip-hdmirx/data/locale/en-US.ini
 new file mode 100644
-index 0000000..11a385e
+index 0000000..49cb412
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/data/locale/en-US.ini
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,50 @@
 +RockchipHdmiRx="Rockchip HDMI Input"
 +Device="Device"
 +NoDevice="No Rockchip HDMI input found"
@@ -201,10 +201,12 @@ index 0000000..11a385e
 +Color="Color"
 +LimitedRange="limited range"
 +FullRange="full range"
-+Frames="Frames"
-+Captured="captured"
-+Dropped="dropped"
-+Skipped="skipped (signal faster than OBS)"
++CapturingFor="Capturing for"
++DroppedFrames="Dropped frames"
++LastMinute="in the last minute"
++Total="in total"
++SkippedFrames="Skipped frames"
++SkippedFrames.Reason="(the signal is faster than the OBS frame rate)"
 +Refresh="Refresh"
 +Conversion="Conversion"
 +GpuTextures="GPU textures"
@@ -342,10 +344,10 @@ index 0000000..81a140b
 +};
 diff --git a/plugins/rockchip-hdmirx/rockchip-hdmirx.c b/plugins/rockchip-hdmirx/rockchip-hdmirx.c
 new file mode 100644
-index 0000000..8476741
+index 0000000..637e123
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/rockchip-hdmirx.c
-@@ -0,0 +1,2047 @@
+@@ -0,0 +1,2122 @@
 +/*
 + * Rockchip HDMI input (rk_hdmirx) source.
 + *
@@ -422,6 +424,10 @@ index 0000000..8476741
 + * HDMI and OBS clocks (two frames landing between ticks) and a late tick
 + * without adding latency in steady state. */
 +#define MAX_QUEUED 2
++/* Drops are shown for the last minute, in one-second buckets, and logged at
++ * most this often while they happen. */
++#define DROP_WINDOW_S 60
++#define DROP_LOG_MS 10000
 +#define NO_FRAME_TIMEOUT_MS 2000
 +#define RETRY_MS 1000
 +/* Signal lock after a receiver reset takes about 2.5 s. */
@@ -564,6 +570,9 @@ index 0000000..8476741
 +	uint64_t frames_dropped; /* lost although OBS could have shown them */
 +	uint64_t frames_skipped; /* left out because the signal is faster than OBS */
 +	uint64_t last_tick_ns;
++	uint64_t capture_start_ns;
++	uint32_t drop_window[DROP_WINDOW_S]; /* drops per second, indexed by second % DROP_WINDOW_S */
++	uint64_t drop_window_sec;            /* second of the newest bucket */
 +	double rga_ms;           /* average RGA conversion time per frame */
 +	double frame_interval;   /* average seconds between captured frames */
 +
@@ -887,9 +896,43 @@ index 0000000..8476741
 +
 +/* --- capture thread ----------------------------------------------------- */
 +
++static void format_duration(struct dstr *out, uint64_t ns)
++{
++	uint64_t sec = ns / 1000000000ULL;
++	dstr_printf(out, "%" PRIu64 ":%02u:%02u", sec / 3600, (unsigned)(sec / 60 % 60), (unsigned)(sec % 60));
++}
++
++/* Moves the drop window to the current second, clearing the seconds it
++ * skipped. Called with the mutex held. */
++static void advance_drop_window(struct hdmirx_source *s, uint64_t now_ns)
++{
++	uint64_t sec = now_ns / 1000000000ULL;
++
++	if (sec - s->drop_window_sec >= DROP_WINDOW_S) {
++		memset(s->drop_window, 0, sizeof(s->drop_window));
++	} else {
++		for (uint64_t i = s->drop_window_sec + 1; i <= sec; i++) {
++			s->drop_window[i % DROP_WINDOW_S] = 0;
++		}
++	}
++	s->drop_window_sec = sec;
++}
++
++/* Called with the mutex held. */
++static uint64_t recent_drops(struct hdmirx_source *s)
++{
++	uint64_t total = 0;
++
++	advance_drop_window(s, os_gettime_ns());
++	for (int i = 0; i < DROP_WINDOW_S; i++) {
++		total += s->drop_window[i];
++	}
++	return total;
++}
++
 +static void stream_teardown(struct hdmirx_source *s)
 +{
-+	uint64_t captured, dropped, skipped;
++	uint64_t captured, dropped, skipped, start_ns;
 +	int fd;
 +
 +	obs_enter_graphics();
@@ -898,7 +941,10 @@ index 0000000..8476741
 +	captured = s->frames_captured;
 +	dropped = s->frames_dropped;
 +	skipped = s->frames_skipped;
++	start_ns = s->capture_start_ns;
 +	s->frames_captured = s->frames_dropped = s->frames_skipped = 0;
++	s->capture_start_ns = 0;
++	memset(s->drop_window, 0, sizeof(s->drop_window));
 +	for (uint32_t i = 0; i < s->num_buffers; i++) {
 +		struct hdmirx_buffer *b = &s->buffers[i];
 +		for (int p = 0; p < 2; p++) {
@@ -930,10 +976,13 @@ index 0000000..8476741
 +		int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 +		xioctl(fd, VIDIOC_STREAMOFF, &type);
 +		close(fd);
++		struct dstr duration = {0};
++		format_duration(&duration, start_ns ? os_gettime_ns() - start_ns : 0);
 +		blog_s(s, LOG_INFO,
-+		       "Capture stopped: %" PRIu64 " frames, %" PRIu64 " dropped, %" PRIu64
++		       "Capture stopped after %s: %" PRIu64 " frames, %" PRIu64 " dropped, %" PRIu64
 +		       " skipped (signal faster than OBS)",
-+		       captured, dropped, skipped);
++		       duration.array, captured, dropped, skipped);
++		dstr_free(&duration);
 +	}
 +}
 +
@@ -1241,6 +1290,7 @@ index 0000000..8476741
 +	s->queued = 0;
 +	s->displayed = -1;
 +	s->import_failed = false;
++	s->capture_start_ns = os_gettime_ns();
 +	set_color_params(s, &fmt.fmt.pix_mp, pq, max_cll);
 +	pthread_mutex_unlock(&s->mutex);
 +
@@ -1342,6 +1392,8 @@ index 0000000..8476741
 +		s->frames_skipped += frames;
 +	} else {
 +		s->frames_dropped += frames;
++		advance_drop_window(s, os_gettime_ns());
++		s->drop_window[s->drop_window_sec % DROP_WINDOW_S] += (uint32_t)frames;
 +	}
 +}
 +
@@ -1352,6 +1404,8 @@ index 0000000..8476741
 +	uint32_t num_planes = s->layout.v4l2_planes;
 +	int idle_ms = 0;
 +	uint64_t color_checked_ns = os_gettime_ns();
++	uint64_t drops_logged_ns = color_checked_ns;
++	uint64_t drops_logged = 0;
 +	double last_timestamp = 0.0;
 +	bool have_sequence = false;
 +	uint32_t last_sequence = 0;
@@ -1364,6 +1418,19 @@ index 0000000..8476741
 +				set_status(s, LOG_INFO, "HDMI signal changed, restarting");
 +				return false;
 +			}
++		}
++		/* Mark drops in the log as they happen, so they can be matched
++		 * to a recording, without a line per frame. */
++		if (now - drops_logged_ns >= DROP_LOG_MS * 1000000ULL) {
++			pthread_mutex_lock(&s->mutex);
++			uint64_t dropped = s->frames_dropped;
++			pthread_mutex_unlock(&s->mutex);
++			if (dropped > drops_logged) {
++				blog_s(s, LOG_WARNING, "%" PRIu64 " frames dropped in the last %d s (%" PRIu64 " in total)",
++				       dropped - drops_logged, (int)((now - drops_logged_ns) / 1000000000ULL), dropped);
++			}
++			drops_logged = dropped;
++			drops_logged_ns = now;
 +		}
 +
 +		struct pollfd pfd[2] = {
@@ -2273,12 +2340,22 @@ index 0000000..8476741
 +	}
 +	add_info(props, "textures", obs_module_text("GpuTextures"), value.array, import_type);
 +
-+	dstr_printf(&value, "%" PRIu64 " %s, %" PRIu64 " %s", s->frames_captured, obs_module_text("Captured"),
-+		    s->frames_dropped, obs_module_text("Dropped"));
++	/* Time instead of a frame count, and the last minute next to the total,
++	 * so it reads the same an hour into a recording. */
++	format_duration(&value, s->capture_start_ns ? os_gettime_ns() - s->capture_start_ns : 0);
++	add_info(props, "capturing_for", obs_module_text("CapturingFor"), value.array, OBS_TEXT_INFO_NORMAL);
++
++	uint64_t recent = recent_drops(s);
++	uint64_t total = s->frames_captured + s->frames_dropped;
++	dstr_printf(&value, "%" PRIu64 " %s, %" PRIu64 " (%.3f%%) %s", recent, obs_module_text("LastMinute"),
++		    s->frames_dropped, total ? 100.0 * (double)s->frames_dropped / (double)total : 0.0,
++		    obs_module_text("Total"));
++	add_info(props, "dropped", obs_module_text("DroppedFrames"), value.array,
++		 recent ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
 +	if (s->frames_skipped) {
-+		dstr_catf(&value, ", %" PRIu64 " %s", s->frames_skipped, obs_module_text("Skipped"));
++		dstr_printf(&value, "%" PRIu64 " %s", s->frames_skipped, obs_module_text("SkippedFrames.Reason"));
++		add_info(props, "skipped", obs_module_text("SkippedFrames"), value.array, OBS_TEXT_INFO_NORMAL);
 +	}
-+	add_info(props, "frames", obs_module_text("Frames"), value.array, OBS_TEXT_INFO_NORMAL);
 +	pthread_mutex_unlock(&s->mutex);
 +
 +	dstr_free(&value);
