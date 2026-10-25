@@ -39,6 +39,7 @@ pick() {
 tools=(
   build-essential cmake ninja-build meson pkgconf git ca-certificates curl jq xz-utils
   quilt nasm patchelf dpkg-dev file python3 ccache
+  m4 xxd  # rkaiq generates its IQ parser with them
 )
 
 ffmpeg_deps=(

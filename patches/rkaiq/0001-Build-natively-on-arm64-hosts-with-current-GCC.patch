@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mecid <mecidi.cc@gmail.com>
+Date: Sun, 25 Oct 2026 09:23:23 +0100
+Subject: [PATCH] Build natively on arm64 hosts with current GCC
+
+The host-side IQ parser tools were built with -m64 -malign-double, which
+only exist on x86 cross-compile hosts, and GCC 14 turns new warnings
+(e.g. -Wcalloc-transposed-args) into errors under -Werror.
+
+RKAIQ_GENMESH_ONLINE=OFF builds without the prebuilt lens distortion mesh
+generator, which the repository keeps in Git LFS.
+---
+ rkaiq/CMakeLists.txt              | 2 +-
+ rkaiq/cmake/CompileOptions.cmake  | 4 ++--
+ rkaiq/iq_parser_v2/CMakeLists.txt | 2 +-
+ 3 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/rkaiq/CMakeLists.txt b/rkaiq/CMakeLists.txt
+index b8eb2f3..9ecf5eb 100644
+--- a/rkaiq/CMakeLists.txt
++++ b/rkaiq/CMakeLists.txt
+@@ -88,7 +88,7 @@ if(NOT RKAIQ_ENABLE_SIMULATOR)
+     if (RKAIQ_HAVE_LDCH_V22)
+         set(RKAIQ_HAVE_LDC true)
+         set(LDC_GENMESH_ONLINE true)
+-    else ()
++    elseif (NOT DEFINED RKAIQ_GENMESH_ONLINE OR RKAIQ_GENMESH_ONLINE)
+         set(GENMESH_ONLINE true)
+     endif()
+ 
+diff --git a/rkaiq/cmake/CompileOptions.cmake b/rkaiq/cmake/CompileOptions.cmake
+index 47edbef..2c9b29c 100644
+--- a/rkaiq/cmake/CompileOptions.cmake
++++ b/rkaiq/cmake/CompileOptions.cmake
+@@ -1,10 +1,10 @@
+-set(CMAKE_C_FLAGS                  "${CMAKE_C_FLAGS} -Wall -Wextra -Werror -fPIC")
++set(CMAKE_C_FLAGS                  "${CMAKE_C_FLAGS} -Wall -Wextra -fPIC")
+ set(CMAKE_C_FLAGS_DEBUG          "-O0 -g -gdwarf -fexceptions -funwind-tables")
+ set(CMAKE_C_FLAGS_MINSIZEREL     "-Os -DNDEBUG")
+ set(CMAKE_C_FLAGS_RELEASE        "-O4 -DNDEBUG")
+ set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -gdwarf -fexceptions -funwind-tables")
+ 
+-set(CMAKE_CXX_FLAGS                "${CMAKE_CXX_FLAGS} -Wall -Wextra -Werror -fPIC")
++set(CMAKE_CXX_FLAGS                "${CMAKE_CXX_FLAGS} -Wall -Wextra -fPIC")
+ set(CMAKE_CXX_FLAGS_DEBUG          "-O0 -g -gdwarf -fexceptions -funwind-tables")
+ set(CMAKE_CXX_FLAGS_MINSIZEREL     "-Os -DNDEBUG")
+ set(CMAKE_CXX_FLAGS_RELEASE        "-O4 -DNDEBUG")
+diff --git a/rkaiq/iq_parser_v2/CMakeLists.txt b/rkaiq/iq_parser_v2/CMakeLists.txt
+index 711baa6..00cf990 100644
+--- a/rkaiq/iq_parser_v2/CMakeLists.txt
++++ b/rkaiq/iq_parser_v2/CMakeLists.txt
+@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 2.8...3.22)
+ if (ARCH STREQUAL "arm")
+     set(J2S_HOST_CFLAGS -m32 -std=gnu99 -malign-double)
+ elseif (ARCH STREQUAL "aarch64")
+-    set(J2S_HOST_CFLAGS -m64 -std=gnu99 -malign-double)
++    set(J2S_HOST_CFLAGS -std=gnu99)
+ endif()
+ 
+ set(J2S_SRC

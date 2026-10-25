@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mecid <mecidi.cc@gmail.com>
+Date: Sun, 25 Oct 2026 09:51:47 +0100
+Subject: [PATCH] Don't crash when the AIQ lock file can't be opened for
+ writing
+
+rk_aiq_uapi_sysctl_init() locks /tmp/aiq<phy>.lock with
+flock(fileno(fopen(path, "w+"))). When another user created that file,
+e.g. root running rkaiq_3A_server once, fopen() fails in the sticky /tmp
+and fileno(NULL) crashes the caller. Open it read-only then (flock works
+on any descriptor), and run without the lock if that fails too.
+---
+ rkaiq/uAPI/rk_aiq_user_api_sysctl.cpp   | 9 +++++++--
+ rkaiq/uAPI2_c/rk_aiq_user_api2_sysctl.c | 9 +++++++--
+ 2 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/rkaiq/uAPI/rk_aiq_user_api_sysctl.cpp b/rkaiq/uAPI/rk_aiq_user_api_sysctl.cpp
+index f46c0b7..7d09be0 100644
+--- a/rkaiq/uAPI/rk_aiq_user_api_sysctl.cpp
++++ b/rkaiq/uAPI/rk_aiq_user_api_sysctl.cpp
+@@ -629,13 +629,18 @@ rk_aiq_uapi_sysctl_init(const char* sns_ent_name,
+ #ifndef __ANDROID__
+     snprintf(lock_path, 255, "/tmp/aiq%d.lock", ctx->_camPhyId);
+     ctx->_lock_file = fopen(lock_path, "w+");
+-    lock_res = flock(fileno(ctx->_lock_file), LOCK_EX);
++    /* Another user (e.g. root running rkaiq_3A_server once) may own the
++     * lock file; /tmp is sticky, so only reading it is allowed then. */
++    if (!ctx->_lock_file)
++        ctx->_lock_file = fopen(lock_path, "r");
++    lock_res = ctx->_lock_file ? flock(fileno(ctx->_lock_file), LOCK_EX) : -1;
+     if (!lock_res) {
+         LOGI("Locking aiq exclusive");
+     }
+     else {
+         LOGI("Lock aiq exclusive failed with res %d", lock_res);
+-        fclose(ctx->_lock_file);
++        if (ctx->_lock_file)
++            fclose(ctx->_lock_file);
+         ctx->_lock_file = NULL;
+     }
+ #endif
+diff --git a/rkaiq/uAPI2_c/rk_aiq_user_api2_sysctl.c b/rkaiq/uAPI2_c/rk_aiq_user_api2_sysctl.c
+index dd26986..40cb1d0 100644
+--- a/rkaiq/uAPI2_c/rk_aiq_user_api2_sysctl.c
++++ b/rkaiq/uAPI2_c/rk_aiq_user_api2_sysctl.c
+@@ -1231,13 +1231,18 @@ rk_aiq_uapi2_sysctl_init(const char* sns_ent_name,
+ #ifndef __ANDROID__
+     snprintf(lock_path, 255, "/tmp/aiq%d.lock", ctx->_camPhyId);
+     ctx->_lock_file = fopen(lock_path, "w+");
+-    lock_res = flock(fileno(ctx->_lock_file), LOCK_EX);
++    /* Another user (e.g. root running rkaiq_3A_server once) may own the
++     * lock file; /tmp is sticky, so only reading it is allowed then. */
++    if (!ctx->_lock_file)
++        ctx->_lock_file = fopen(lock_path, "r");
++    lock_res = ctx->_lock_file ? flock(fileno(ctx->_lock_file), LOCK_EX) : -1;
+     if (!lock_res) {
+         LOGI("Locking aiq exclusive");
+     }
+     else {
+         LOGI("Lock aiq exclusive failed with res %d", lock_res);
+-        fclose(ctx->_lock_file);
++        if (ctx->_lock_file)
++            fclose(ctx->_lock_file);
+         ctx->_lock_file = NULL;
+     }
+ #endif

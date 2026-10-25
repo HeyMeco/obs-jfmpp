@@ -51,6 +51,12 @@ grep -q 'Hardware.RKMPP.H264' /usr/share/obs/obs-studio/locale/en-US.ini || die 
   || die "Rockchip HDMI input source missing"
 ldd "$plugins/rockchip-hdmirx.so" | grep -q "$FFMPEG_PREFIX/lib/librga" \
   || die "Rockchip HDMI input source isn't linked to the bundled librga (no 10-bit support)"
+[[ -f "$plugins/rockchip-camera.so" && -f "$plugin_data/rockchip-camera/camera.effect" ]] \
+  || die "Rockchip camera source missing"
+ldd "$plugins/rockchip-camera.so" | grep -q "$FFMPEG_PREFIX/lib/librkaiq" \
+  || die "Rockchip camera source isn't linked to the bundled librkaiq"
+[[ -f "$FFMPEG_PREFIX/share/rkaiq/iqfiles/imx415_RADXA-CAMERA-4K_DEFAULT.json" ]] \
+  || die "rkaiq tuning files missing"
 
 ldd "$plugins/obs-ffmpeg.so" | grep -E 'libavcodec|rockchip_mpp|librga' || true
 # Same as Debian's autopkgtest for obs-studio.

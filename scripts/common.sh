@@ -19,6 +19,10 @@ RKMPP_REPO="${RKMPP_REPO:-https://github.com/nyanmisaka/rk-mirrors.git}"
 RKMPP_BRANCH="${RKMPP_BRANCH:-jellyfin-mpp-next}"
 RKRGA_REPO="${RKRGA_REPO:-https://github.com/nyanmisaka/rk-mirrors.git}"
 RKRGA_BRANCH="${RKRGA_BRANCH:-jellyfin-rga-next}"
+# Rockchip's camera 3A engine (rkaiq) for the RK3588 ISP, from an SDK mirror whose
+# AIQ release (v6.0x32) matches the ISP driver ABI of the vendor 6.1/6.12 kernels.
+RKAIQ_REPO="${RKAIQ_REPO:-https://github.com/mixtile-rockchip/mixtile-sdk-linux-external-camera_engine_rkaiq.git}"
+RKAIQ_BRANCH="${RKAIQ_BRANCH:-linux-6.1-stan-rkr7}"
 
 JOBS="${JOBS:-$(nproc)}"
 

@@ -6,7 +6,7 @@ Comment:
  built with --enable-gpl --enable-version3, the combined work is distributed
  under the GNU GPL version 3. The exact sources are the upstream tags named in
  the package version, plus the build scripts and patches in
- @SOURCE_URL@ (patches/obs-studio).
+ @SOURCE_URL@ (patches/obs-studio, patches/rkaiq).
 
 Files: *
 Copyright: 2013-2026 OBS Project contributors (https://github.com/obsproject/obs-studio)
@@ -27,6 +27,15 @@ License: Apache-2.0 and MIT
 Files: usr/lib/obs-jellyfin-ffmpeg/lib/librga*
 Copyright: Rockchip Electronics Co., Ltd.
 Comment: Rockchip RGA, from https://github.com/nyanmisaka/rk-mirrors (jellyfin-rga-next)
+License: Apache-2.0
+
+Files: usr/lib/obs-jellyfin-ffmpeg/lib/librkaiq* usr/lib/obs-jellyfin-ffmpeg/share/rkaiq/*
+Copyright: Rockchip Electronics Co., Ltd.
+Comment: Rockchip camera 3A engine (rkaiq) and RK3588 sensor tuning files, from
+ https://github.com/mixtile-rockchip/mixtile-sdk-linux-external-camera_engine_rkaiq
+ (linux-6.1-stan-rkr7) with the patches in patches/rkaiq. Its exposure and
+ white balance algorithms are linked from Rockchip's prebuilt static libraries.
+ See /usr/share/doc/obs-studio/NOTICE.rkaiq.
 License: Apache-2.0
 
 Files: usr/lib/*/obs-plugins/libcef.so usr/lib/*/obs-plugins/libEGL.so

@@ -50,10 +50,11 @@ jobs:
           jf="${JF_INPUT:-$(gh api repos/jellyfin/jellyfin-ffmpeg/releases/latest --jq .tag_name)}"
           jf="v${jf#v}"
           tag="obs-${obs}"
-          # MPP/RGA branch heads (repo and branches as in scripts/common.sh), for the
-          # FFmpeg cache key: the branches move without new jellyfin-ffmpeg releases.
+          # MPP/RGA/rkaiq branch heads (repos and branches as in scripts/common.sh), for
+          # the FFmpeg cache key: the branches move without new jellyfin-ffmpeg releases.
           mpp="$(gh api repos/nyanmisaka/rk-mirrors/commits/jellyfin-mpp-next --jq .sha)"
           rga="$(gh api repos/nyanmisaka/rk-mirrors/commits/jellyfin-rga-next --jq .sha)"
+          aiq="$(gh api repos/mixtile-rockchip/mixtile-sdk-linux-external-camera_engine_rkaiq/commits/linux-6.1-stan-rkr7 --jq .sha)"
 
           exists=false
           gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && exists=true
@@ -69,7 +70,7 @@ jobs:
           {
             echo "obs_version=$obs"
             echo "jf_version=$jf"
-            echo "rk_commits=${mpp:0:12}-${rga:0:12}"
+            echo "rk_commits=${mpp:0:12}-${rga:0:12}-${aiq:0:12}"
             echo "tag=$tag"
             echo "build=$build"
             echo "publish=$publish"
@@ -101,13 +102,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # jellyfin-ffmpeg + MPP/RGA only change with their versions; build-ffmpeg.sh
-      # skips the build when the restored copy matches and still runs.
+      # jellyfin-ffmpeg + MPP/RGA + rkaiq only change with their versions;
+      # build-ffmpeg.sh and build-rkaiq.sh skip the build when the restored copy matches.
       - name: Cache jellyfin-ffmpeg
         uses: actions/cache@v6
         with:
           path: /usr/lib/obs-jellyfin-ffmpeg
-          key: ffmpeg-${{ matrix.distro }}-${{ needs.resolve.outputs.jf_version }}-${{ needs.resolve.outputs.rk_commits }}-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+          key: ffmpeg-${{ matrix.distro }}-${{ needs.resolve.outputs.jf_version }}-${{ needs.resolve.outputs.rk_commits }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'scripts/build-rkaiq.sh', 'patches/rkaiq/*') }}
 
       # Compiler cache for whatever does get built (OBS, mostly). Saved under a new key
       # each run and restored from the newest entry, preferring the same OBS release.

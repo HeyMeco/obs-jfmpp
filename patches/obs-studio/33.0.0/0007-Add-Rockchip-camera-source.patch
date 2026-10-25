@@ -1,0 +1,1878 @@
+diff --git a/plugins/CMakeLists.txt b/plugins/CMakeLists.txt
+index 2317dc2..3b155ee 100644
+--- a/plugins/CMakeLists.txt
++++ b/plugins/CMakeLists.txt
+@@ -109,6 +109,7 @@ check_obs_websocket()
+ 
+ add_core_module(obs-x264)
+ add_core_module(oss-audio PLATFORMS FREEBSD OPENBSD)
++add_core_module(rockchip-camera PLATFORMS LINUX)
+ add_core_module(rockchip-hdmirx PLATFORMS LINUX)
+ add_core_module(rtmp-services)
+ add_core_module(sndio PLATFORMS LINUX FREEBSD OPENBSD)
+diff --git a/plugins/rockchip-camera/CMakeLists.txt b/plugins/rockchip-camera/CMakeLists.txt
+new file mode 100644
+index 0000000..0baf3e1
+--- /dev/null
++++ b/plugins/rockchip-camera/CMakeLists.txt
+@@ -0,0 +1,50 @@
++cmake_minimum_required(VERSION 3.28...3.30)
++
++option(ENABLE_ROCKCHIP_CAMERA "Build OBS with Rockchip camera (ISP) support" ON)
++
++if(NOT ENABLE_ROCKCHIP_CAMERA)
++  return()
++endif()
++
++# Rockchip's 3A engine runs the ISP for raw sensors; it is built for one ISP
++# generation (here the RK3588's ISP3x), so its headers need the matching define.
++find_path(RKAIQ_INCLUDE_DIR rk_aiq_user_api2_sysctl.h PATH_SUFFIXES rkaiq/uAPI2)
++find_library(RKAIQ_LIBRARY rkaiq)
++if(NOT RKAIQ_INCLUDE_DIR OR NOT RKAIQ_LIBRARY)
++  message(WARNING "rkaiq not found, Rockchip camera source disabled")
++  return()
++endif()
++
++add_library(rockchip-camera MODULE)
++add_library(OBS::rockchip-camera ALIAS rockchip-camera)
++
++target_sources(rockchip-camera PRIVATE rockchip-camera.c)
++
++cmake_path(GET RKAIQ_INCLUDE_DIR PARENT_PATH rkaiq_include)
++cmake_path(GET RKAIQ_LIBRARY PARENT_PATH rkaiq_libdir)
++cmake_path(GET rkaiq_libdir PARENT_PATH rkaiq_prefix)
++
++target_include_directories(
++  rockchip-camera
++  PRIVATE
++    ${rkaiq_include}
++    ${rkaiq_include}/uAPI2
++    ${rkaiq_include}/common
++    ${rkaiq_include}/xcore
++    ${rkaiq_include}/algos
++    ${rkaiq_include}/iq_parser
++    ${rkaiq_include}/iq_parser_v2
++)
++target_compile_definitions(
++  rockchip-camera
++  PRIVATE ISP_HW_V30 RKAIQ_IQ_DIR="${rkaiq_prefix}/share/rkaiq/iqfiles"
++)
++# The rkaiq headers trip over OBS's stricter warnings.
++target_compile_options(rockchip-camera PRIVATE -Wno-error -Wno-unused-parameter -Wno-sign-compare)
++
++target_link_libraries(rockchip-camera PRIVATE OBS::libobs ${RKAIQ_LIBRARY} m)
++# rkaiq declares more API than each ISP build implements. A missing symbol must
++# fail here: OBS refuses to start when a core module can't be loaded.
++target_link_options(rockchip-camera PRIVATE -Wl,-z,defs)
++
++set_target_properties_obs(rockchip-camera PROPERTIES FOLDER plugins PREFIX "")
+diff --git a/plugins/rockchip-camera/data/camera.effect b/plugins/rockchip-camera/data/camera.effect
+new file mode 100644
+index 0000000..809c1f3
+--- /dev/null
++++ b/plugins/rockchip-camera/data/camera.effect
+@@ -0,0 +1,46 @@
++// Draws NV12 frames from the Rockchip ISP, imported as dma-buf textures:
++// image = Y (R8), image1 = CbCr (R8G8, R = Cb).
++
++uniform float4x4 ViewProj;
++uniform texture2d image;
++uniform texture2d image1;
++
++uniform float4x4 color_matrix;
++uniform float3 color_range_min = {0.0, 0.0, 0.0};
++uniform float3 color_range_max = {1.0, 1.0, 1.0};
++
++sampler_state def_sampler {
++	Filter   = Linear;
++	AddressU = Clamp;
++	AddressV = Clamp;
++};
++
++struct VertInOut {
++	float4 pos : POSITION;
++	float2 uv  : TEXCOORD0;
++};
++
++VertInOut VSDefault(VertInOut vert_in)
++{
++	VertInOut vert_out;
++	vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
++	vert_out.uv  = vert_in.uv;
++	return vert_out;
++}
++
++float4 PSYCbCr(VertInOut vert_in) : TARGET
++{
++	float y = image.Sample(def_sampler, vert_in.uv).r;
++	float2 cbcr = image1.Sample(def_sampler, vert_in.uv).rg;
++	float3 yuv = clamp(float3(y, cbcr), color_range_min, color_range_max);
++	return float4(saturate(mul(float4(yuv, 1.0), color_matrix).rgb), 1.0);
++}
++
++technique YCbCr
++{
++	pass
++	{
++		vertex_shader = VSDefault(vert_in);
++		pixel_shader  = PSYCbCr(vert_in);
++	}
++}
+diff --git a/plugins/rockchip-camera/data/locale/en-US.ini b/plugins/rockchip-camera/data/locale/en-US.ini
+new file mode 100644
+index 0000000..2023569
+--- /dev/null
++++ b/plugins/rockchip-camera/data/locale/en-US.ini
+@@ -0,0 +1,53 @@
++RockchipCamera="Rockchip Camera"
++Camera="Camera"
++NoCamera="No camera found on the Rockchip ISP"
++Status="Status"
++Starting="Starting…"
++Capturing="Capturing"
++Module="Camera module"
++Sensor="sensor"
++Resolution="Resolution"
++Resolution.Full="Full resolution"
++FrameRate="Frame rate"
++FrameRate.Sensor="Sensor's frame rate, fixed"
++FrameRate.Variable="Variable (lower in low light)"
++FrameRate.Description="The frame rate the sensor runs at. The highest is the one of the sensor driver's mode (30 fps for the IMX415 with the stock driver); only lower rates can be set. Fixed rates suit OBS best; Variable lets the camera lengthen the exposure in low light at the cost of a lower, changing frame rate."
++AntiFlicker="Anti-flicker"
++AntiFlicker.50="50 Hz mains (Europe, Asia, Africa, Oceania)"
++AntiFlicker.60="60 Hz mains (Americas, parts of Asia)"
++AntiFlicker.Off="Off"
++AntiFlicker.Description="Keeps the exposure time a multiple of the mains half-period, so lights powered from the mains don't cause rolling bands."
++ExposureAuto="Automatic exposure"
++ShutterSpeed="Shutter speed"
++ShutterSpeed.Description="Exposure time per frame, at most one frame of the sensor (1/30 s at 30 fps). Under mains lighting, 1/50 or 1/100 s (50 Hz) and 1/60 or 1/120 s (60 Hz) avoid flicker; faster speeds freeze motion but need more light or gain."
++Gain="Gain"
++WhiteBalanceAuto="Automatic white balance"
++ColorTemperature="Color temperature"
++Brightness="Brightness"
++Contrast="Contrast"
++Saturation="Saturation"
++Hue="Hue"
++Sharpness="Sharpness"
++Mirror="Mirror horizontally"
++Flip="Flip vertically"
++Exposure="Exposure"
++ExposureMax="at its maximum (scene too dark)"
++WhiteBalance="White balance"
++Tuning="Tuning"
++Tuning.Fallback="made for another module with this sensor; colors may be off"
++Tuning.External="by rkaiq_3A_server, which is running; the image settings above don't apply"
++Conversion="Conversion"
++Conversion.Path="ISP scaling, GPU shader, zero-copy (no CPU copy)"
++FullRange="full range"
++LimitedRange="limited range"
++ImportFailed="import failed (see the log)"
++CapturingFor="Capturing for"
++DroppedFrames="Dropped frames"
++LastMinute="in the last minute"
++Total="in total"
++SkippedFrames="Skipped frames"
++SkippedFrames.Reason="(the camera is faster than the OBS frame rate)"
++Refresh="Refresh"
++Connect="Connect"
++Disconnect="Disconnect"
++Disconnected="Disconnected"
+diff --git a/plugins/rockchip-camera/rockchip-camera.c b/plugins/rockchip-camera/rockchip-camera.c
+new file mode 100644
+index 0000000..f1d4272
+--- /dev/null
++++ b/plugins/rockchip-camera/rockchip-camera.c
+@@ -0,0 +1,1693 @@
++/*
++ * Rockchip camera source: MIPI CSI sensors behind the RK3588 ISP.
++ *
++ * Raw Bayer sensors need Rockchip's 3A engine (rkaiq): it reads the ISP's
++ * statistics and programs exposure, white balance, colour correction, noise
++ * reduction etc. from the sensor's tuning file. Without it the ISP outputs a
++ * dark, green image. The source runs rkaiq for the camera it captures, unless
++ * rkaiq_3A_server is already doing that.
++ *
++ * The ISP also scales to the chosen resolution and writes NV12, which is
++ * imported into the GPU from dma-bufs and converted to RGB in a shader, as in
++ * the HDMI input source, so frames never pass through the CPU.
++ */
++
++#include <obs-module.h>
++#include <media-io/video-io.h>
++#include <util/dstr.h>
++#include <util/platform.h>
++#include <util/threading.h>
++
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <linux/videodev2.h>
++#include <math.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/eventfd.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include <rk_aiq_user_api2_sysctl.h>
++#include <rk_aiq_user_api2_imgproc.h>
++#include <rk_aiq_user_api2_ae.h>
++
++OBS_DECLARE_MODULE()
++OBS_MODULE_USE_DEFAULT_LOCALE("rockchip-camera", "en-US")
++
++MODULE_EXPORT const char *obs_module_description(void)
++{
++	return "Rockchip camera (ISP with rkaiq 3A) with zero-copy GPU conversion";
++}
++
++#define blog_s(s, level, msg, ...) blog(level, "[rockchip-camera: '%s'] " msg, obs_source_get_name((s)->source), ##__VA_ARGS__)
++
++#define FOURCC(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
++#define DRM_FORMAT_R8 FOURCC('R', '8', ' ', ' ')
++#define DRM_FORMAT_GR88 FOURCC('G', 'R', '8', '8')
++
++/* Up to MAX_QUEUED frames wait for OBS, one is displayed and up to
++ * RETIRE_TICKS more may still be read by the GPU; the rest stay with the ISP. */
++#define MAX_BUFFERS 8
++#define MIN_BUFFERS 4
++/* Ticks a buffer stays out of the queue after it was last drawn, so the GPU
++ * has finished reading it before the ISP writes into it again. */
++#define RETIRE_TICKS 3
++/* Captured frames waiting for video_tick, as in the HDMI input source. */
++#define MAX_QUEUED 2
++#define DROP_WINDOW_S 60
++#define DROP_LOG_MS 10000
++/* rkaiq takes a moment to converge after starting, but frames flow from the start. */
++#define NO_FRAME_TIMEOUT_MS 3000
++#define RETRY_MS 2000
++
++#define MAX_CAMERAS 8
++#define ISP_CARD "rkisp_mainpath"
++
++/* Defaults of the tuning files: colour processing is neutral at 128. */
++#define LEVEL_DEFAULT 128
++#define SHARPNESS_DEFAULT 50
++#define WB_CT_DEFAULT 5000
++/* 1/100 s: no flicker under 50 Hz lights, the tuning's default */
++#define SHUTTER_DEFAULT 100
++
++struct image_settings {
++	int antiflicker; /* 0, 50 or 60 Hz */
++	int fps;         /* 0: the sensor's, -1: lower in low light */
++	bool exposure_auto;
++	int shutter; /* manual exposure time as 1/shutter s */
++	double gain;
++	bool wb_auto;
++	int wb_ct;
++	int brightness, contrast, saturation, hue, sharpness;
++	bool mirror, flip;
++};
++
++struct camera_buffer {
++	int dmabuf;
++	gs_texture_t *tex[2];
++	int retire_age; /* -1 while queued in the driver, displayed or waiting for tick */
++};
++
++struct camera_source {
++	obs_source_t *source;
++	char *sensor; /* setting: sensor entity name, e.g. "m00_f_imx415 3-001a" */
++	uint32_t req_width, req_height; /* setting: 0 = the ISP's full size */
++	bool disconnected; /* by the Disconnect button, UI thread only */
++
++	pthread_t thread;
++	bool thread_running;
++	volatile bool stop;
++	int wake_fd;
++
++	gs_effect_t *effect;
++
++	/* rkaiq context of the running camera, NULL while stopped or when
++	 * rkaiq_3A_server runs the ISP. Only used with aiq_lock held. */
++	rk_aiq_sys_ctx_t *aiq;
++
++	/* Everything below is shared between the capture thread, the UI,
++	 * video_tick and video_render and protected by mutex. Lock order:
++	 * graphics, then aiq_lock, then mutex. */
++	pthread_mutex_t mutex;
++	struct image_settings settings;
++	int fd; /* -1 while not streaming */
++	char *device;
++	uint32_t width, height, pitch;
++	uint32_t sensor_width, sensor_height, sensor_fps;
++	struct camera_buffer buffers[MAX_BUFFERS];
++	uint32_t num_buffers;
++	int queue[MAX_QUEUED];
++	uint32_t queued;
++	int displayed;
++	bool import_failed;
++	float color_matrix[16];
++	float color_range_min[3];
++	float color_range_max[3];
++	enum video_colorspace colorspace;
++	enum video_range_type range;
++	uint64_t frames_captured;
++	uint64_t frames_dropped;
++	uint64_t frames_skipped;
++	uint64_t last_tick_ns;
++	uint64_t capture_start_ns;
++	uint32_t drop_window[DROP_WINDOW_S];
++	uint64_t drop_window_sec;
++	double frame_interval;
++	struct dstr module; /* camera module and lens from the device tree */
++	struct dstr iq_file;
++	bool iq_fallback;  /* no tuning for this module, using another one for the sensor */
++	bool external_3a;  /* rkaiq_3A_server runs the ISP */
++
++	struct dstr last_status;
++	int last_status_level;
++};
++
++/* rkaiq keeps global state and isn't thread-safe; every call holds this. */
++static pthread_mutex_t aiq_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* Cameras in use, so a second source doesn't start another 3A engine on one. */
++static pthread_mutex_t cameras_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct {
++	char *sensor;
++	struct camera_source *owner;
++} cameras[MAX_CAMERAS];
++
++static int xioctl(int fd, unsigned long request, void *arg)
++{
++	int ret;
++	do {
++		ret = ioctl(fd, request, arg);
++	} while (ret < 0 && errno == EINTR);
++	return ret;
++}
++
++static void set_status(struct camera_source *s, int level, const char *status)
++{
++	pthread_mutex_lock(&s->mutex);
++	if (s->last_status.array && strcmp(s->last_status.array, status) == 0) {
++		pthread_mutex_unlock(&s->mutex);
++		return;
++	}
++	dstr_copy(&s->last_status, status);
++	s->last_status_level = level;
++	pthread_mutex_unlock(&s->mutex);
++
++	blog_s(s, level, "%s", status);
++	obs_source_update_properties(s->source);
++}
++
++static void wait_ms(struct camera_source *s, int ms)
++{
++	struct pollfd pfd = {.fd = s->wake_fd, .events = POLLIN};
++	if (!s->stop) {
++		poll(&pfd, 1, ms);
++	}
++}
++
++/* --- cameras ------------------------------------------------------------ */
++
++/* "m00_f_imx415 3-001a" -> "imx415": rkmodule entity names are
++ * m<index>_<facing>_<sensor> <i2c bus>-<address>. */
++static void sensor_short_name(const char *entity, struct dstr *out)
++{
++	const char *start = entity;
++	if (entity[0] == 'm' && strlen(entity) > 6 && entity[3] == '_' && entity[5] == '_') {
++		start = entity + 6;
++	}
++	const char *end = strchr(start, ' ');
++	dstr_ncopy(out, start, end ? (size_t)(end - start) : strlen(start));
++}
++
++static bool read_text(const char *path, struct dstr *out)
++{
++	char buf[128];
++	FILE *f = fopen(path, "r");
++	size_t n;
++
++	if (!f) {
++		return false;
++	}
++	n = fread(buf, 1, sizeof(buf) - 1, f);
++	fclose(f);
++	while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\0' || buf[n - 1] == ' ')) {
++		n--;
++	}
++	buf[n] = 0;
++	dstr_copy(out, buf);
++	return n > 0;
++}
++
++/* The camera module and lens names in the sensor's device tree node select its
++ * tuning file: <sensor>_<module>_<lens>.json. */
++static void read_module_info(const char *entity, struct dstr *module, struct dstr *lens)
++{
++	DIR *dir = opendir("/sys/class/video4linux");
++	struct dirent *e;
++
++	dstr_free(module);
++	dstr_free(lens);
++	if (!dir) {
++		return;
++	}
++	while ((e = readdir(dir))) {
++		struct dstr path = {0}, name = {0};
++		if (strncmp(e->d_name, "v4l-subdev", 10) != 0) {
++			continue;
++		}
++		dstr_printf(&path, "/sys/class/video4linux/%s/name", e->d_name);
++		if (read_text(path.array, &name) && strcmp(name.array, entity) == 0) {
++			dstr_printf(&path, "/sys/class/video4linux/%s/device/of_node/rockchip,camera-module-name", e->d_name);
++			read_text(path.array, module);
++			dstr_printf(&path, "/sys/class/video4linux/%s/device/of_node/rockchip,camera-module-lens-name",
++				    e->d_name);
++			read_text(path.array, lens);
++		}
++		dstr_free(&path);
++		dstr_free(&name);
++	}
++	closedir(dir);
++}
++
++static bool file_exists(const char *dir, const char *name)
++{
++	struct dstr path = {0};
++	dstr_printf(&path, "%s/%s", dir, name);
++	bool ok = access(path.array, R_OK) == 0;
++	dstr_free(&path);
++	return ok;
++}
++
++/* Picks the tuning file for the camera: the module's own, else another module
++ * with the same sensor (lenses and IR filters differ, so colours may be off). */
++static bool find_iq_file(const char *entity, struct dstr *module_desc, struct dstr *file, bool *fallback)
++{
++	struct dstr sensor = {0}, module = {0}, lens = {0}, prefix = {0};
++	struct dirent **list;
++	int n;
++
++	sensor_short_name(entity, &sensor);
++	read_module_info(entity, &module, &lens);
++	dstr_free(file);
++	*fallback = false;
++
++	if (module.len) {
++		dstr_printf(module_desc, "%s, %s", module.array, lens.len ? lens.array : "?");
++		dstr_printf(file, "%s_%s_%s.json", sensor.array, module.array, lens.len ? lens.array : "");
++		if (!file_exists(RKAIQ_IQ_DIR, file->array)) {
++			dstr_free(file);
++		}
++	} else {
++		dstr_free(module_desc);
++	}
++
++	if (!file->len) {
++		dstr_printf(&prefix, "%s_", sensor.array);
++		n = scandir(RKAIQ_IQ_DIR, &list, NULL, alphasort);
++		for (int i = 0; i < n; i++) {
++			const char *name = list[i]->d_name;
++			size_t len = strlen(name);
++			if (!file->len && strncmp(name, prefix.array, prefix.len) == 0 && len > 5 &&
++			    strcmp(name + len - 5, ".json") == 0) {
++				dstr_copy(file, name);
++				*fallback = true;
++			}
++			free(list[i]);
++		}
++		if (n > 0) {
++			free(list);
++		}
++	}
++
++	dstr_free(&sensor);
++	dstr_free(&module);
++	dstr_free(&lens);
++	dstr_free(&prefix);
++	return file->len > 0;
++}
++
++/* Calls cb for every ISP main path in /dev with a sensor behind it. */
++static void for_each_camera(void (*cb)(void *param, const char *path, const char *sensor), void *param)
++{
++	struct dirent **list;
++	int n = scandir("/dev", &list, NULL, alphasort);
++
++	for (int i = 0; i < n; i++) {
++		if (strncmp(list[i]->d_name, "video", 5) == 0) {
++			struct v4l2_capability cap = {0};
++			struct dstr path = {0};
++			int fd;
++
++			dstr_printf(&path, "/dev/%s", list[i]->d_name);
++			fd = open(path.array, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++			if (fd >= 0 && xioctl(fd, VIDIOC_QUERYCAP, &cap) == 0 &&
++			    strcmp((const char *)cap.card, ISP_CARD) == 0) {
++				close(fd);
++				fd = -1;
++				pthread_mutex_lock(&aiq_lock);
++				const char *sensor = rk_aiq_uapi2_sysctl_getBindedSnsEntNmByVd(path.array);
++				char *copy = sensor && *sensor ? bstrdup(sensor) : NULL;
++				pthread_mutex_unlock(&aiq_lock);
++				if (copy) {
++					cb(param, path.array, copy);
++				}
++				bfree(copy);
++			}
++			if (fd >= 0) {
++				close(fd);
++			}
++			dstr_free(&path);
++		}
++		free(list[i]);
++	}
++	if (n > 0) {
++		free(list);
++	}
++}
++
++struct find_camera {
++	const char *sensor; /* NULL: the first camera */
++	char *path;
++	char *found_sensor;
++};
++
++static void find_camera_cb(void *param, const char *path, const char *sensor)
++{
++	struct find_camera *f = param;
++	if (!f->path && (!f->sensor || strcmp(f->sensor, sensor) == 0)) {
++		f->path = bstrdup(path);
++		f->found_sensor = bstrdup(sensor);
++	}
++}
++
++struct list_cameras {
++	obs_property_t *list;
++	const char *sensor; /* selected in the settings, NULL: the first camera */
++	char *path;         /* its main path node */
++	char *found_sensor;
++};
++
++static void list_camera_cb(void *param, const char *path, const char *sensor)
++{
++	struct list_cameras *l = param;
++	struct dstr name = {0}, module = {0}, lens = {0};
++
++	if (!l->path && (!l->sensor || strcmp(l->sensor, sensor) == 0)) {
++		l->path = bstrdup(path);
++		l->found_sensor = bstrdup(sensor);
++	}
++
++	sensor_short_name(sensor, &name);
++	read_module_info(sensor, &module, &lens);
++	if (module.len) {
++		dstr_catf(&name, " (%s)", module.array);
++	}
++	dstr_catf(&name, ", %s", path);
++	obs_property_list_add_string(l->list, name.array, sensor);
++	dstr_free(&name);
++	dstr_free(&module);
++	dstr_free(&lens);
++}
++
++/* rkaiq_3A_server (Rockchip's and Radxa's camera packages) runs the 3A engine
++ * itself whenever an ISP stream starts; a second one would fight it. */
++static bool rkaiq_server_running(void)
++{
++	DIR *dir = opendir("/proc");
++	struct dirent *e;
++	bool found = false;
++
++	if (!dir) {
++		return false;
++	}
++	while (!found && (e = readdir(dir))) {
++		struct dstr path = {0}, comm = {0};
++		if (e->d_name[0] < '0' || e->d_name[0] > '9') {
++			continue;
++		}
++		dstr_printf(&path, "/proc/%s/comm", e->d_name);
++		found = read_text(path.array, &comm) && strcmp(comm.array, "rkaiq_3A_server") == 0;
++		dstr_free(&path);
++		dstr_free(&comm);
++	}
++	closedir(dir);
++	return found;
++}
++
++/* Returns the source already using the camera, or NULL after claiming it. */
++static struct camera_source *claim_camera(struct camera_source *s, const char *sensor)
++{
++	struct camera_source *owner = NULL;
++	int free_slot = -1;
++
++	pthread_mutex_lock(&cameras_lock);
++	for (int i = 0; i < MAX_CAMERAS; i++) {
++		if (!cameras[i].sensor) {
++			if (free_slot < 0) {
++				free_slot = i;
++			}
++		} else if (strcmp(cameras[i].sensor, sensor) == 0) {
++			owner = cameras[i].owner;
++		}
++	}
++	if (!owner && free_slot >= 0) {
++		cameras[free_slot].sensor = bstrdup(sensor);
++		cameras[free_slot].owner = s;
++	}
++	pthread_mutex_unlock(&cameras_lock);
++	return owner == s ? NULL : owner;
++}
++
++static void release_camera(struct camera_source *s)
++{
++	pthread_mutex_lock(&cameras_lock);
++	for (int i = 0; i < MAX_CAMERAS; i++) {
++		if (cameras[i].owner == s) {
++			bfree(cameras[i].sensor);
++			cameras[i].sensor = NULL;
++			cameras[i].owner = NULL;
++		}
++	}
++	pthread_mutex_unlock(&cameras_lock);
++}
++
++/* --- rkaiq -------------------------------------------------------------- */
++
++static expPwrLineFreq_t power_line(int hz)
++{
++	return hz == 50 ? EXP_PWR_LINE_FREQ_50HZ : hz == 60 ? EXP_PWR_LINE_FREQ_60HZ : EXP_PWR_LINE_FREQ_DIS;
++}
++
++/* Frame rate and manual exposure through the AE attributes: this rkaiq build
++ * has no setFrameRate/setExpManualTime for the RK3588 ISP. */
++static void set_exposure(rk_aiq_sys_ctx_t *ctx, const struct image_settings *st)
++{
++	Uapi_ExpSwAttrV2_t attr;
++
++	memset(&attr, 0, sizeof(attr));
++	if (rk_aiq_user_api2_ae_getExpSwAttr(ctx, &attr) != XCAM_RETURN_NO_ERROR) {
++		return;
++	}
++	attr.sync.sync_mode = RK_AIQ_UAPI_MODE_ASYNC;
++	attr.sync.done = false;
++	/* Fixed unless asked otherwise: OBS expects a steady frame rate, and
++	 * the tuning files fix it too. 0 is the sensor mode's rate. */
++	attr.stAuto.stFrmRate.isFpsFix = st->fps >= 0;
++	attr.stAuto.stFrmRate.FpsValue = st->fps > 0 ? (float)st->fps : 0.0f;
++	if (st->exposure_auto) {
++		attr.AecOpType = RK_AIQ_OP_MODE_AUTO;
++	} else {
++		attr.AecOpType = RK_AIQ_OP_MODE_MANUAL;
++		attr.stManual.LinearAE.ManualTimeEn = true;
++		attr.stManual.LinearAE.ManualGainEn = true;
++		attr.stManual.LinearAE.TimeValue = 1.0f / (float)st->shutter;
++		attr.stManual.LinearAE.GainValue = (float)st->gain;
++	}
++	rk_aiq_user_api2_ae_setExpSwAttr(ctx, attr);
++}
++
++/* Called with aiq_lock held. Only settings that differ from old are sent, so
++ * moving a slider doesn't make rkaiq re-run everything; old = NULL sends all. */
++static void apply_settings(struct camera_source *s, const struct image_settings *st, const struct image_settings *old)
++{
++	rk_aiq_sys_ctx_t *ctx = s->aiq;
++#define CHANGED(field) (!old || old->field != st->field)
++
++	if (!ctx) {
++		return;
++	}
++	if (CHANGED(antiflicker)) {
++		rk_aiq_uapi2_setAntiFlickerEn(ctx, st->antiflicker != 0);
++		if (st->antiflicker) {
++			rk_aiq_uapi2_setExpPwrLineFreqMode(ctx, power_line(st->antiflicker));
++		}
++	}
++	if (CHANGED(fps) || CHANGED(exposure_auto) || CHANGED(shutter) || CHANGED(gain)) {
++		set_exposure(ctx, st);
++	}
++	if (CHANGED(wb_auto) || CHANGED(wb_ct)) {
++		if (st->wb_auto) {
++			rk_aiq_uapi2_setWBMode(ctx, OP_AUTO);
++		} else {
++			rk_aiq_uapi2_setWBMode(ctx, OP_MANUAL);
++			rk_aiq_uapi2_setMWBCT(ctx, (unsigned int)st->wb_ct);
++		}
++	}
++	if (CHANGED(brightness)) {
++		rk_aiq_uapi2_setBrightness(ctx, (unsigned int)st->brightness);
++	}
++	if (CHANGED(contrast)) {
++		rk_aiq_uapi2_setContrast(ctx, (unsigned int)st->contrast);
++	}
++	if (CHANGED(saturation)) {
++		rk_aiq_uapi2_setSaturation(ctx, (unsigned int)st->saturation);
++	}
++	if (CHANGED(hue)) {
++		rk_aiq_uapi2_setHue(ctx, (unsigned int)st->hue);
++	}
++	if (CHANGED(sharpness)) {
++		rk_aiq_uapi2_setSharpness(ctx, (unsigned int)st->sharpness);
++	}
++	if (CHANGED(mirror) || CHANGED(flip)) {
++		/* rkaiq drops the frames read out while the Bayer order changes. */
++		rk_aiq_uapi2_setMirrorFlip(ctx, st->mirror, st->flip, 3);
++	}
++#undef CHANGED
++}
++
++static bool sensor_mode(const char *entity, uint32_t *width, uint32_t *height, uint32_t *fps)
++{
++	rk_aiq_static_info_t info;
++	bool found = false;
++
++	memset(&info, 0, sizeof(info));
++	if (rk_aiq_uapi2_sysctl_getStaticMetas(entity, &info) != XCAM_RETURN_NO_ERROR) {
++		return false;
++	}
++	/* The largest linear (non-HDR) mode is what the ISP runs by default. */
++	for (int i = 0; i < info.sensor_info.num && i < SUPPORT_FMT_MAX; i++) {
++		const rk_frame_fmt_t *f = &info.sensor_info.support_fmt[i];
++		if (f->hdr_mode == 0 && (uint32_t)f->width * f->height > *width * *height) {
++			*width = f->width;
++			*height = f->height;
++			*fps = f->fps;
++			found = true;
++		}
++	}
++	return found;
++}
++
++/* Starts the 3A engine for the camera. Called with aiq_lock held. */
++static bool aiq_start(struct camera_source *s, const char *sensor, uint32_t width, uint32_t height,
++		      const char *iq_file, struct dstr *error)
++{
++	rk_aiq_sys_ctx_t *ctx;
++	XCamReturn ret;
++
++	rk_aiq_uapi2_sysctl_preInit(sensor, RK_AIQ_WORKING_MODE_NORMAL, iq_file);
++	ctx = rk_aiq_uapi2_sysctl_init(sensor, RKAIQ_IQ_DIR, NULL, NULL);
++	if (!ctx) {
++		dstr_printf(error, "Unable to start the camera's 3A engine (rkaiq) with %s", iq_file);
++		return false;
++	}
++	ret = rk_aiq_uapi2_sysctl_prepare(ctx, width, height, RK_AIQ_WORKING_MODE_NORMAL);
++	if (ret == XCAM_RETURN_NO_ERROR) {
++		ret = rk_aiq_uapi2_sysctl_start(ctx);
++	}
++	if (ret != XCAM_RETURN_NO_ERROR) {
++		dstr_printf(error, "Unable to start the camera's 3A engine (rkaiq): error %d", ret);
++		rk_aiq_uapi2_sysctl_deinit(ctx);
++		return false;
++	}
++	s->aiq = ctx;
++	return true;
++}
++
++/* Called with aiq_lock held. */
++static void aiq_stop(struct camera_source *s)
++{
++	if (s->aiq) {
++		rk_aiq_uapi2_sysctl_stop(s->aiq, false);
++		rk_aiq_uapi2_sysctl_deinit(s->aiq);
++		s->aiq = NULL;
++	}
++}
++
++/* --- capture thread ----------------------------------------------------- */
++
++static void format_duration(struct dstr *out, uint64_t ns)
++{
++	uint64_t sec = ns / 1000000000ULL;
++	dstr_printf(out, "%" PRIu64 ":%02u:%02u", sec / 3600, (unsigned)(sec / 60 % 60), (unsigned)(sec % 60));
++}
++
++/* Called with the mutex held. */
++static void advance_drop_window(struct camera_source *s, uint64_t now_ns)
++{
++	uint64_t sec = now_ns / 1000000000ULL;
++
++	if (sec - s->drop_window_sec >= DROP_WINDOW_S) {
++		memset(s->drop_window, 0, sizeof(s->drop_window));
++	} else {
++		for (uint64_t i = s->drop_window_sec + 1; i <= sec; i++) {
++			s->drop_window[i % DROP_WINDOW_S] = 0;
++		}
++	}
++	s->drop_window_sec = sec;
++}
++
++/* Called with the mutex held. */
++static uint64_t recent_drops(struct camera_source *s)
++{
++	uint64_t total = 0;
++
++	advance_drop_window(s, os_gettime_ns());
++	for (int i = 0; i < DROP_WINDOW_S; i++) {
++		total += s->drop_window[i];
++	}
++	return total;
++}
++
++/* Counts frames that never reach the screen; frames left out because the
++ * camera is faster than OBS aren't drops. Called with the mutex held. */
++static void count_lost(struct camera_source *s, uint64_t frames)
++{
++	uint64_t obs_frame_ns = video_output_get_frame_time(obs_get_video());
++
++	if (os_gettime_ns() - s->last_tick_ns > obs_frame_ns * 3 / 2) {
++		return;
++	}
++	if (s->frame_interval > 0.0 && s->frame_interval * 1e9 < (double)obs_frame_ns * 0.95) {
++		s->frames_skipped += frames;
++	} else {
++		s->frames_dropped += frames;
++		advance_drop_window(s, os_gettime_ns());
++		s->drop_window[s->drop_window_sec % DROP_WINDOW_S] += (uint32_t)frames;
++	}
++}
++
++static bool queue_buffer(int fd, uint32_t index)
++{
++	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
++	struct v4l2_buffer buf = {
++		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++		.memory = V4L2_MEMORY_MMAP,
++		.index = index,
++		.m.planes = planes,
++		.length = 1,
++	};
++	return xioctl(fd, VIDIOC_QBUF, &buf) == 0;
++}
++
++/* Called with the mutex held. The ISP writes BT.601 full range (JPEG) unless
++ * the tuning's colour space matrix says otherwise, which G_FMT reports. */
++static void set_color_params(struct camera_source *s, const struct v4l2_pix_format_mplane *mp)
++{
++	enum video_colorspace cs = VIDEO_CS_601;
++	enum video_range_type range = VIDEO_RANGE_FULL;
++
++	if (mp->ycbcr_enc == V4L2_YCBCR_ENC_709 || mp->colorspace == V4L2_COLORSPACE_REC709) {
++		cs = VIDEO_CS_709;
++	}
++	if (mp->quantization == V4L2_QUANTIZATION_LIM_RANGE) {
++		range = VIDEO_RANGE_PARTIAL;
++	}
++	video_format_get_parameters_for_format(cs, range, VIDEO_FORMAT_NV12, s->color_matrix, s->color_range_min,
++					       s->color_range_max);
++	s->colorspace = cs;
++	s->range = range;
++}
++
++static void stream_teardown(struct camera_source *s)
++{
++	uint64_t captured, dropped, skipped, start_ns;
++	int fd;
++
++	obs_enter_graphics();
++	pthread_mutex_lock(&s->mutex);
++	fd = s->fd;
++	captured = s->frames_captured;
++	dropped = s->frames_dropped;
++	skipped = s->frames_skipped;
++	start_ns = s->capture_start_ns;
++	s->frames_captured = s->frames_dropped = s->frames_skipped = 0;
++	s->capture_start_ns = 0;
++	memset(s->drop_window, 0, sizeof(s->drop_window));
++	for (uint32_t i = 0; i < s->num_buffers; i++) {
++		struct camera_buffer *b = &s->buffers[i];
++		for (int p = 0; p < 2; p++) {
++			gs_texture_destroy(b->tex[p]);
++			b->tex[p] = NULL;
++		}
++		if (b->dmabuf >= 0) {
++			close(b->dmabuf);
++		}
++		b->dmabuf = -1;
++	}
++	s->fd = -1;
++	s->frame_interval = 0.0;
++	s->num_buffers = 0;
++	s->queued = 0;
++	s->displayed = -1;
++	s->import_failed = false;
++	s->width = s->height = s->pitch = 0;
++	pthread_mutex_unlock(&s->mutex);
++	obs_leave_graphics();
++
++	if (fd >= 0) {
++		int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++		xioctl(fd, VIDIOC_STREAMOFF, &type);
++		close(fd);
++		struct dstr duration = {0};
++		format_duration(&duration, start_ns ? os_gettime_ns() - start_ns : 0);
++		blog_s(s, LOG_INFO,
++		       "Capture stopped after %s: %" PRIu64 " frames, %" PRIu64 " dropped, %" PRIu64
++		       " skipped (camera faster than OBS)",
++		       duration.array, captured, dropped, skipped);
++		dstr_free(&duration);
++	}
++
++	/* The 3A engine stops after the stream, as in Rockchip's demo. */
++	pthread_mutex_lock(&aiq_lock);
++	aiq_stop(s);
++	pthread_mutex_unlock(&aiq_lock);
++	release_camera(s);
++}
++
++/* The ISP scales down but not up; 0x0 asks for its full size. */
++static void isp_max_size(int fd, uint32_t *max_w, uint32_t *max_h)
++{
++	struct v4l2_frmsizeenum fs = {.index = 0, .pixel_format = V4L2_PIX_FMT_NV12};
++
++	*max_w = *max_h = 0;
++	if (xioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fs) == 0) {
++		if (fs.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
++			*max_w = fs.discrete.width;
++			*max_h = fs.discrete.height;
++		} else {
++			*max_w = fs.stepwise.max_width;
++			*max_h = fs.stepwise.max_height;
++		}
++	}
++}
++
++static void pick_size(int fd, uint32_t req_w, uint32_t req_h, uint32_t *w, uint32_t *h)
++{
++	uint32_t max_w, max_h;
++
++	isp_max_size(fd, &max_w, &max_h);
++	*w = req_w && (!max_w || req_w <= max_w) ? req_w : max_w;
++	*h = req_h && (!max_h || req_h <= max_h) ? req_h : max_h;
++}
++
++static bool stream_setup(struct camera_source *s)
++{
++	struct find_camera found = {.sensor = s->sensor && *s->sensor ? s->sensor : NULL};
++	struct v4l2_format fmt = {.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE};
++	struct v4l2_requestbuffers req = {
++		.count = MAX_BUFFERS,
++		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++		.memory = V4L2_MEMORY_MMAP,
++	};
++	struct camera_buffer buffers[MAX_BUFFERS];
++	struct dstr status = {0}, iq_file = {0}, module = {0};
++	struct image_settings settings;
++	uint32_t sensor_w = 0, sensor_h = 0, sensor_fps = 0, width, height;
++	struct camera_source *owner;
++	bool fallback = false, external;
++	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	int fd = -1;
++
++	for_each_camera(find_camera_cb, &found);
++	if (!found.path) {
++		set_status(s, LOG_WARNING, found.sensor ? "Camera not found" : "No camera found");
++		return false;
++	}
++
++	owner = claim_camera(s, found.found_sensor);
++	if (owner) {
++		dstr_printf(&status, "The camera is in use by '%s'", obs_source_get_name(owner->source));
++		set_status(s, LOG_WARNING, status.array);
++		goto fail_free;
++	}
++
++	pthread_mutex_lock(&aiq_lock);
++	sensor_mode(found.found_sensor, &sensor_w, &sensor_h, &sensor_fps);
++	pthread_mutex_unlock(&aiq_lock);
++	if (!sensor_w) {
++		set_status(s, LOG_WARNING, "Unable to read the sensor modes");
++		goto fail;
++	}
++
++	external = rkaiq_server_running();
++	if (!external && !find_iq_file(found.found_sensor, &module, &iq_file, &fallback)) {
++		struct dstr name = {0};
++		sensor_short_name(found.found_sensor, &name);
++		dstr_printf(&status, "No tuning file for the %s sensor in %s", name.array, RKAIQ_IQ_DIR);
++		set_status(s, LOG_WARNING, status.array);
++		dstr_free(&name);
++		goto fail;
++	}
++	if (external) {
++		struct dstr lens = {0};
++		read_module_info(found.found_sensor, &module, &lens);
++		dstr_free(&lens);
++	}
++
++	fd = open(found.path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++	if (fd < 0) {
++		dstr_printf(&status, "Unable to open %s: %s", found.path, strerror(errno));
++		set_status(s, LOG_WARNING, status.array);
++		goto fail;
++	}
++	pick_size(fd, s->req_width, s->req_height, &width, &height);
++
++	if (!external) {
++		/* camera_update changes the settings with aiq_lock held, so
++		 * none get lost between reading them and starting rkaiq. */
++		pthread_mutex_lock(&aiq_lock);
++		pthread_mutex_lock(&s->mutex);
++		settings = s->settings;
++		pthread_mutex_unlock(&s->mutex);
++		bool started = aiq_start(s, found.found_sensor, sensor_w, sensor_h, iq_file.array, &status);
++		if (started) {
++			apply_settings(s, &settings, NULL);
++		}
++		pthread_mutex_unlock(&aiq_lock);
++		if (!started) {
++			set_status(s, LOG_WARNING, status.array);
++			goto fail;
++		}
++	}
++
++	fmt.fmt.pix_mp.width = width;
++	fmt.fmt.pix_mp.height = height;
++	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
++	fmt.fmt.pix_mp.num_planes = 1;
++	if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0 || fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_NV12 ||
++	    fmt.fmt.pix_mp.num_planes != 1) {
++		dstr_printf(&status, "Unable to capture NV12 at %ux%u: %s", width, height, strerror(errno));
++		set_status(s, LOG_WARNING, status.array);
++		goto fail;
++	}
++
++	if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0 || req.count < MIN_BUFFERS) {
++		dstr_printf(&status, "Unable to allocate capture buffers (%s, got %u)", strerror(errno), req.count);
++		set_status(s, LOG_WARNING, status.array);
++		goto fail;
++	}
++	if (req.count > MAX_BUFFERS) {
++		req.count = MAX_BUFFERS;
++	}
++
++	for (uint32_t i = 0; i < MAX_BUFFERS; i++) {
++		buffers[i] = (struct camera_buffer){.dmabuf = -1, .retire_age = -1};
++	}
++	for (uint32_t i = 0; i < req.count; i++) {
++		struct v4l2_exportbuffer exp = {
++			.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++			.index = i,
++			.flags = O_RDONLY | O_CLOEXEC,
++		};
++		if (xioctl(fd, VIDIOC_EXPBUF, &exp) < 0) {
++			set_status(s, LOG_WARNING, "Unable to export capture buffers as dma-buf");
++			goto fail_buffers;
++		}
++		buffers[i].dmabuf = exp.fd;
++		if (!queue_buffer(fd, i)) {
++			set_status(s, LOG_WARNING, "Unable to queue capture buffers");
++			goto fail_buffers;
++		}
++	}
++
++	if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
++		dstr_printf(&status, "Unable to start streaming: %s", strerror(errno));
++		set_status(s, LOG_WARNING, status.array);
++		goto fail_buffers;
++	}
++
++	pthread_mutex_lock(&s->mutex);
++	s->fd = fd;
++	bfree(s->device);
++	s->device = bstrdup(found.path);
++	s->width = fmt.fmt.pix_mp.width;
++	s->height = fmt.fmt.pix_mp.height;
++	s->pitch = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
++	s->sensor_width = sensor_w;
++	s->sensor_height = sensor_h;
++	s->sensor_fps = sensor_fps;
++	memcpy(s->buffers, buffers, sizeof(buffers));
++	s->num_buffers = req.count;
++	s->queued = 0;
++	s->displayed = -1;
++	s->import_failed = false;
++	s->capture_start_ns = os_gettime_ns();
++	s->external_3a = external;
++	s->iq_fallback = fallback;
++	dstr_copy_dstr(&s->iq_file, &iq_file);
++	dstr_copy_dstr(&s->module, &module);
++	set_color_params(s, &fmt.fmt.pix_mp);
++	pthread_mutex_unlock(&s->mutex);
++
++	{
++		struct dstr name = {0};
++		sensor_short_name(found.found_sensor, &name);
++		dstr_printf(&status, "Capturing %ux%u from %s (%ux%u @ %u fps) on %s, %u buffers", s->width, s->height,
++			    name.array, sensor_w, sensor_h, sensor_fps, found.path, req.count);
++		if (external) {
++			dstr_cat(&status, ", 3A by rkaiq_3A_server");
++		} else {
++			dstr_catf(&status, ", tuning %s%s", iq_file.array, fallback ? " (not made for this module)" : "");
++		}
++		set_status(s, LOG_INFO, status.array);
++		dstr_free(&name);
++	}
++	dstr_free(&status);
++	dstr_free(&iq_file);
++	dstr_free(&module);
++	bfree(found.path);
++	bfree(found.found_sensor);
++	return true;
++
++fail_buffers:
++	for (uint32_t i = 0; i < MAX_BUFFERS; i++) {
++		if (buffers[i].dmabuf >= 0) {
++			close(buffers[i].dmabuf);
++		}
++	}
++fail:
++	if (fd >= 0) {
++		close(fd);
++	}
++	pthread_mutex_lock(&aiq_lock);
++	aiq_stop(s);
++	pthread_mutex_unlock(&aiq_lock);
++	release_camera(s);
++fail_free:
++	dstr_free(&status);
++	dstr_free(&iq_file);
++	dstr_free(&module);
++	bfree(found.path);
++	bfree(found.found_sensor);
++	return false;
++}
++
++/* Returns true when the camera stopped delivering frames. */
++static bool stream_run(struct camera_source *s)
++{
++	int fd = s->fd;
++	int idle_ms = 0;
++	uint64_t drops_logged_ns = os_gettime_ns();
++	uint64_t drops_logged = 0;
++	double last_timestamp = 0.0;
++	bool have_sequence = false;
++	uint32_t last_sequence = 0;
++
++	while (!s->stop) {
++		uint64_t now = os_gettime_ns();
++		if (now - drops_logged_ns >= DROP_LOG_MS * 1000000ULL) {
++			pthread_mutex_lock(&s->mutex);
++			uint64_t dropped = s->frames_dropped;
++			pthread_mutex_unlock(&s->mutex);
++			if (dropped > drops_logged) {
++				blog_s(s, LOG_WARNING, "%" PRIu64 " frames dropped in the last %d s (%" PRIu64 " in total)",
++				       dropped - drops_logged, (int)((now - drops_logged_ns) / 1000000000ULL), dropped);
++			}
++			drops_logged = dropped;
++			drops_logged_ns = now;
++		}
++
++		struct pollfd pfd[2] = {
++			{.fd = fd, .events = POLLIN},
++			{.fd = s->wake_fd, .events = POLLIN},
++		};
++		int ret = poll(pfd, 2, 500);
++
++		if (s->stop) {
++			return false;
++		}
++		if (ret < 0) {
++			if (errno == EINTR) {
++				continue;
++			}
++			return false;
++		}
++		if (ret == 0) {
++			idle_ms += 500;
++			if (idle_ms >= NO_FRAME_TIMEOUT_MS) {
++				return true;
++			}
++			continue;
++		}
++		if (pfd[0].revents & POLLERR) {
++			return false;
++		}
++		if (!(pfd[0].revents & POLLIN)) {
++			continue;
++		}
++
++		struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
++		struct v4l2_buffer buf = {
++			.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++			.memory = V4L2_MEMORY_MMAP,
++			.m.planes = planes,
++			.length = 1,
++		};
++		if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
++			if (errno == EAGAIN) {
++				continue;
++			}
++			return false;
++		}
++		idle_ms = 0;
++
++		double timestamp = (double)buf.timestamp.tv_sec + (double)buf.timestamp.tv_usec / 1e6;
++		double interval = last_timestamp > 0.0 ? timestamp - last_timestamp : 0.0;
++		last_timestamp = timestamp;
++
++		pthread_mutex_lock(&s->mutex);
++		if (interval > 0.0 && interval < 1.0) {
++			s->frame_interval = s->frame_interval > 0.0 ? s->frame_interval * 0.95 + interval * 0.05
++								    : interval;
++		}
++		/* The ISP skips frames while no buffer is queued. While rkaiq
++		 * settles after starting, it skips a frame by itself. */
++		bool settled = now - s->capture_start_ns > 1000000000ULL;
++		if (have_sequence && settled && buf.sequence - last_sequence > 1 &&
++		    buf.sequence - last_sequence < 1000) {
++			count_lost(s, buf.sequence - last_sequence - 1);
++		}
++		have_sequence = true;
++		last_sequence = buf.sequence;
++
++		if (buf.flags & V4L2_BUF_FLAG_ERROR) {
++			queue_buffer(fd, buf.index);
++			if (settled) {
++				count_lost(s, 1);
++			}
++		} else {
++			if (s->queued == MAX_QUEUED) {
++				queue_buffer(fd, s->queue[0]);
++				memmove(s->queue, s->queue + 1, --s->queued * sizeof(s->queue[0]));
++				count_lost(s, 1);
++			}
++			s->queue[s->queued++] = buf.index;
++			s->frames_captured++;
++		}
++		pthread_mutex_unlock(&s->mutex);
++	}
++	return false;
++}
++
++static void *capture_thread(void *data)
++{
++	struct camera_source *s = data;
++
++	os_set_thread_name("rockchip-camera");
++
++	while (!s->stop) {
++		if (!stream_setup(s)) {
++			wait_ms(s, RETRY_MS);
++			continue;
++		}
++		bool stalled = stream_run(s);
++		stream_teardown(s);
++		if (stalled && !s->stop) {
++			set_status(s, LOG_WARNING, "No frames from the camera, restarting");
++		}
++		wait_ms(s, 100);
++	}
++	return NULL;
++}
++
++static void start_capture(struct camera_source *s)
++{
++	uint64_t val;
++
++	if (s->thread_running) {
++		return;
++	}
++	while (read(s->wake_fd, &val, sizeof(val)) > 0) {
++	}
++	s->stop = false;
++	if (pthread_create(&s->thread, NULL, capture_thread, s) == 0) {
++		s->thread_running = true;
++	} else {
++		blog_s(s, LOG_ERROR, "Unable to start the capture thread");
++	}
++}
++
++static void stop_capture(struct camera_source *s)
++{
++	uint64_t one = 1;
++
++	if (!s->thread_running) {
++		return;
++	}
++	s->stop = true;
++	if (write(s->wake_fd, &one, sizeof(one)) < 0) {
++		blog_s(s, LOG_WARNING, "Unable to wake the capture thread: %s", strerror(errno));
++	}
++	pthread_join(s->thread, NULL);
++	s->thread_running = false;
++}
++
++/* --- obs_source_info ---------------------------------------------------- */
++
++static const char *camera_get_name(void *unused)
++{
++	UNUSED_PARAMETER(unused);
++	return obs_module_text("RockchipCamera");
++}
++
++static void read_settings(obs_data_t *settings, struct image_settings *st)
++{
++	st->antiflicker = (int)obs_data_get_int(settings, "antiflicker");
++	st->fps = (int)obs_data_get_int(settings, "fps");
++	st->exposure_auto = obs_data_get_bool(settings, "exposure_auto");
++	st->shutter = (int)obs_data_get_int(settings, "shutter");
++	if (st->shutter <= 0) {
++		st->shutter = SHUTTER_DEFAULT;
++	}
++	st->gain = obs_data_get_double(settings, "gain");
++	st->wb_auto = obs_data_get_bool(settings, "wb_auto");
++	st->wb_ct = (int)obs_data_get_int(settings, "wb_ct");
++	st->brightness = (int)obs_data_get_int(settings, "brightness");
++	st->contrast = (int)obs_data_get_int(settings, "contrast");
++	st->saturation = (int)obs_data_get_int(settings, "saturation");
++	st->hue = (int)obs_data_get_int(settings, "hue");
++	st->sharpness = (int)obs_data_get_int(settings, "sharpness");
++	st->mirror = obs_data_get_bool(settings, "mirror");
++	st->flip = obs_data_get_bool(settings, "flip");
++}
++
++static void camera_update(void *data, obs_data_t *settings)
++{
++	struct camera_source *s = data;
++	const char *sensor = obs_data_get_string(settings, "sensor");
++	const char *resolution = obs_data_get_string(settings, "resolution");
++	uint32_t w = 0, h = 0;
++	struct image_settings st, old;
++
++	if (sscanf(resolution, "%ux%u", &w, &h) != 2) {
++		w = h = 0;
++	}
++	read_settings(settings, &st);
++
++	if (s->thread_running && s->sensor && strcmp(s->sensor, sensor) == 0 && s->req_width == w &&
++	    s->req_height == h) {
++		/* Image settings apply to the running camera. */
++		pthread_mutex_lock(&aiq_lock);
++		pthread_mutex_lock(&s->mutex);
++		old = s->settings;
++		s->settings = st;
++		pthread_mutex_unlock(&s->mutex);
++		apply_settings(s, &st, &old);
++		pthread_mutex_unlock(&aiq_lock);
++		return;
++	}
++
++	stop_capture(s);
++	pthread_mutex_lock(&s->mutex);
++	s->settings = st;
++	pthread_mutex_unlock(&s->mutex);
++	bfree(s->sensor);
++	s->sensor = bstrdup(sensor);
++	s->req_width = w;
++	s->req_height = h;
++	if (!s->disconnected) {
++		start_capture(s);
++	}
++}
++
++static void camera_defaults(obs_data_t *settings)
++{
++	obs_data_set_default_string(settings, "resolution", "");
++	obs_data_set_default_int(settings, "antiflicker", 50);
++	obs_data_set_default_int(settings, "fps", 0);
++	obs_data_set_default_bool(settings, "exposure_auto", true);
++	obs_data_set_default_int(settings, "shutter", SHUTTER_DEFAULT);
++	obs_data_set_default_double(settings, "gain", 1.0);
++	obs_data_set_default_bool(settings, "wb_auto", true);
++	obs_data_set_default_int(settings, "wb_ct", WB_CT_DEFAULT);
++	obs_data_set_default_int(settings, "brightness", LEVEL_DEFAULT);
++	obs_data_set_default_int(settings, "contrast", LEVEL_DEFAULT);
++	obs_data_set_default_int(settings, "saturation", LEVEL_DEFAULT);
++	obs_data_set_default_int(settings, "hue", LEVEL_DEFAULT);
++	obs_data_set_default_int(settings, "sharpness", SHARPNESS_DEFAULT);
++	obs_data_set_default_bool(settings, "mirror", false);
++	obs_data_set_default_bool(settings, "flip", false);
++}
++
++static void *camera_create(obs_data_t *settings, obs_source_t *source)
++{
++	struct camera_source *s = bzalloc(sizeof(*s));
++	char *effect_path;
++
++	s->source = source;
++	s->fd = -1;
++	s->displayed = -1;
++	pthread_mutex_init(&s->mutex, NULL);
++
++	s->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++	if (s->wake_fd < 0) {
++		blog_s(s, LOG_ERROR, "eventfd: %s", strerror(errno));
++		pthread_mutex_destroy(&s->mutex);
++		bfree(s);
++		return NULL;
++	}
++
++	effect_path = obs_module_file("camera.effect");
++	obs_enter_graphics();
++	s->effect = gs_effect_create_from_file(effect_path, NULL);
++	obs_leave_graphics();
++	bfree(effect_path);
++	if (!s->effect) {
++		blog_s(s, LOG_ERROR, "Unable to load camera.effect");
++	}
++
++	camera_update(s, settings);
++	return s;
++}
++
++static void camera_destroy(void *data)
++{
++	struct camera_source *s = data;
++
++	stop_capture(s);
++
++	obs_enter_graphics();
++	gs_effect_destroy(s->effect);
++	obs_leave_graphics();
++
++	close(s->wake_fd);
++	pthread_mutex_destroy(&s->mutex);
++	dstr_free(&s->last_status);
++	dstr_free(&s->iq_file);
++	dstr_free(&s->module);
++	bfree(s->sensor);
++	bfree(s->device);
++	bfree(s);
++}
++
++static void camera_tick(void *data, float seconds)
++{
++	struct camera_source *s = data;
++	uint64_t obs_frame_ns = video_output_get_frame_time(obs_get_video());
++
++	/* When OBS falls behind, it skips the frames it missed; skip as many
++	 * captured frames so the latency doesn't grow. */
++	uint32_t advance = obs_frame_ns ? (uint32_t)lround(seconds * 1e9 / (double)obs_frame_ns) : 1;
++	if (advance < 1) {
++		advance = 1;
++	}
++
++	pthread_mutex_lock(&s->mutex);
++	s->last_tick_ns = os_gettime_ns();
++	if (s->fd >= 0) {
++		for (uint32_t i = 0; i < s->num_buffers; i++) {
++			struct camera_buffer *b = &s->buffers[i];
++			if (b->retire_age >= 0 && ++b->retire_age > RETIRE_TICKS) {
++				b->retire_age = -1;
++				queue_buffer(s->fd, i);
++			}
++		}
++		for (; advance > 1 && s->queued > 1; advance--) {
++			queue_buffer(s->fd, s->queue[0]);
++			memmove(s->queue, s->queue + 1, --s->queued * sizeof(s->queue[0]));
++		}
++		if (s->queued > 0) {
++			if (s->displayed >= 0) {
++				s->buffers[s->displayed].retire_age = 0;
++			}
++			s->displayed = s->queue[0];
++			memmove(s->queue, s->queue + 1, --s->queued * sizeof(s->queue[0]));
++		}
++	}
++	pthread_mutex_unlock(&s->mutex);
++}
++
++static bool import_buffer(struct camera_source *s, struct camera_buffer *b)
++{
++	static const uint64_t linear = 0; /* DRM_FORMAT_MOD_LINEAR */
++	uint32_t pitch = s->pitch;
++	uint32_t offsets[2] = {0, s->pitch * s->height};
++
++	b->tex[0] = gs_texture_create_from_dmabuf(s->width, s->height, DRM_FORMAT_R8, GS_R8, 1, &b->dmabuf, &pitch,
++						  &offsets[0], &linear);
++	b->tex[1] = gs_texture_create_from_dmabuf(s->width / 2, s->height / 2, DRM_FORMAT_GR88, GS_R8G8, 1,
++						  &b->dmabuf, &pitch, &offsets[1], &linear);
++	if (!b->tex[0] || !b->tex[1]) {
++		blog_s(s, LOG_ERROR, "Unable to import an NV12 buffer (%ux%u pitch %u) as GPU textures", s->width,
++		       s->height, s->pitch);
++		return false;
++	}
++	return true;
++}
++
++static void camera_render(void *data, gs_effect_t *unused)
++{
++	struct camera_source *s = data;
++	UNUSED_PARAMETER(unused);
++
++	if (!s->effect) {
++		return;
++	}
++
++	pthread_mutex_lock(&s->mutex);
++	if (s->displayed >= 0 && !s->import_failed) {
++		struct camera_buffer *b = &s->buffers[s->displayed];
++		if (b->tex[0] || import_buffer(s, b)) {
++			gs_effect_set_texture(gs_effect_get_param_by_name(s->effect, "image"), b->tex[0]);
++			gs_effect_set_texture(gs_effect_get_param_by_name(s->effect, "image1"), b->tex[1]);
++			gs_effect_set_val(gs_effect_get_param_by_name(s->effect, "color_matrix"), s->color_matrix,
++					  sizeof(s->color_matrix));
++			gs_effect_set_val(gs_effect_get_param_by_name(s->effect, "color_range_min"),
++					  s->color_range_min, sizeof(s->color_range_min));
++			gs_effect_set_val(gs_effect_get_param_by_name(s->effect, "color_range_max"),
++					  s->color_range_max, sizeof(s->color_range_max));
++			while (gs_effect_loop(s->effect, "YCbCr")) {
++				gs_draw_sprite(b->tex[0], 0, s->width, s->height);
++			}
++		} else {
++			s->import_failed = true;
++		}
++	}
++	pthread_mutex_unlock(&s->mutex);
++}
++
++static uint32_t camera_get_width(void *data)
++{
++	struct camera_source *s = data;
++	pthread_mutex_lock(&s->mutex);
++	uint32_t width = s->displayed >= 0 ? s->width : 0;
++	pthread_mutex_unlock(&s->mutex);
++	return width;
++}
++
++static uint32_t camera_get_height(void *data)
++{
++	struct camera_source *s = data;
++	pthread_mutex_lock(&s->mutex);
++	uint32_t height = s->displayed >= 0 ? s->height : 0;
++	pthread_mutex_unlock(&s->mutex);
++	return height;
++}
++
++static void add_info(obs_properties_t *props, const char *name, const char *label, const char *value,
++		     enum obs_text_info_type type)
++{
++	struct dstr text = {0};
++	obs_property_t *p;
++
++	dstr_printf(&text, "%s: %s", label, value);
++	p = obs_properties_add_text(props, name, text.array, OBS_TEXT_INFO);
++	obs_property_text_set_info_type(p, type);
++	dstr_free(&text);
++}
++
++static void add_exposure_info(struct camera_source *s, obs_properties_t *props)
++{
++	Uapi_ExpQueryInfo_t exp;
++	unsigned int ct = 0;
++	bool have_exp = false, have_ct = false;
++	struct dstr value = {0};
++
++	memset(&exp, 0, sizeof(exp));
++	pthread_mutex_lock(&aiq_lock);
++	if (s->aiq) {
++		have_exp = rk_aiq_user_api2_ae_queryExpResInfo(s->aiq, &exp) == XCAM_RETURN_NO_ERROR;
++		have_ct = rk_aiq_uapi2_getWBCT(s->aiq, &ct) == XCAM_RETURN_NO_ERROR && ct > 0;
++	}
++	pthread_mutex_unlock(&aiq_lock);
++
++	if (have_exp) {
++		const RkAiqExpRealParam_t *e = &exp.LinAeInfo.LinearExp;
++		double t = e->integration_time;
++		if (t > 0.0 && t < 0.5) {
++			dstr_printf(&value, "1/%.0f s (%.2f ms), %s %.2fx", 1.0 / t, t * 1000.0, obs_module_text("Gain"),
++				    e->analog_gain * (e->digital_gain > 0.0f ? e->digital_gain : 1.0f) *
++					    (e->isp_dgain > 0.0f ? e->isp_dgain : 1.0f));
++		} else {
++			dstr_printf(&value, "%.3f s, %s %.2fx", t, obs_module_text("Gain"), e->analog_gain);
++		}
++		if (exp.IsExpMax) {
++			dstr_catf(&value, ", %s", obs_module_text("ExposureMax"));
++		}
++		add_info(props, "exposure_now", obs_module_text("Exposure"), value.array,
++			 exp.IsExpMax ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
++	}
++	if (have_ct) {
++		dstr_printf(&value, "%u K", ct);
++		add_info(props, "wb_now", obs_module_text("WhiteBalance"), value.array, OBS_TEXT_INFO_NORMAL);
++	}
++	dstr_free(&value);
++}
++
++static void add_camera_info(struct camera_source *s, obs_properties_t *props)
++{
++	struct dstr value = {0};
++
++	pthread_mutex_lock(&s->mutex);
++	if (s->fd < 0) {
++		const char *status = s->disconnected        ? obs_module_text("Disconnected")
++				     : s->last_status.array ? s->last_status.array
++							    : obs_module_text("Starting");
++		add_info(props, "status", obs_module_text("Status"), status,
++			 !s->disconnected && s->last_status_level == LOG_WARNING ? OBS_TEXT_INFO_WARNING
++										 : OBS_TEXT_INFO_NORMAL);
++		pthread_mutex_unlock(&s->mutex);
++		return;
++	}
++
++	add_info(props, "status", obs_module_text("Status"), obs_module_text("Capturing"), OBS_TEXT_INFO_NORMAL);
++	if (s->module.len) {
++		add_info(props, "module", obs_module_text("Module"), s->module.array, OBS_TEXT_INFO_NORMAL);
++	}
++
++	dstr_printf(&value, "%ux%u (%s %ux%u @ %u fps)", s->width, s->height, obs_module_text("Sensor"),
++		    s->sensor_width, s->sensor_height, s->sensor_fps);
++	add_info(props, "resolution_now", obs_module_text("Resolution"), value.array, OBS_TEXT_INFO_NORMAL);
++
++	if (s->frame_interval > 0.0) {
++		dstr_printf(&value, "%.2f fps", 1.0 / s->frame_interval);
++		add_info(props, "fps_now", obs_module_text("FrameRate"), value.array, OBS_TEXT_INFO_NORMAL);
++	}
++
++	if (s->external_3a) {
++		add_info(props, "tuning", obs_module_text("Tuning"), obs_module_text("Tuning.External"),
++			 OBS_TEXT_INFO_WARNING);
++	} else {
++		dstr_copy_dstr(&value, &s->iq_file);
++		if (s->iq_fallback) {
++			dstr_catf(&value, " (%s)", obs_module_text("Tuning.Fallback"));
++		}
++		add_info(props, "tuning", obs_module_text("Tuning"), value.array,
++			 s->iq_fallback ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
++	}
++
++	dstr_printf(&value, "NV12 (%s, %s), %s", s->colorspace == VIDEO_CS_709 ? "Rec. 709" : "Rec. 601",
++		    obs_module_text(s->range == VIDEO_RANGE_FULL ? "FullRange" : "LimitedRange"),
++		    obs_module_text("Conversion.Path"));
++	enum obs_text_info_type conv_type = OBS_TEXT_INFO_NORMAL;
++	if (s->import_failed) {
++		dstr_catf(&value, ", %s", obs_module_text("ImportFailed"));
++		conv_type = OBS_TEXT_INFO_ERROR;
++	}
++	add_info(props, "conversion", obs_module_text("Conversion"), value.array, conv_type);
++
++	format_duration(&value, s->capture_start_ns ? os_gettime_ns() - s->capture_start_ns : 0);
++	add_info(props, "capturing_for", obs_module_text("CapturingFor"), value.array, OBS_TEXT_INFO_NORMAL);
++
++	uint64_t recent = recent_drops(s);
++	uint64_t total = s->frames_captured + s->frames_dropped;
++	dstr_printf(&value, "%" PRIu64 " %s, %" PRIu64 " (%.3f%%) %s", recent, obs_module_text("LastMinute"),
++		    s->frames_dropped, total ? 100.0 * (double)s->frames_dropped / (double)total : 0.0,
++		    obs_module_text("Total"));
++	add_info(props, "dropped", obs_module_text("DroppedFrames"), value.array,
++		 recent ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
++	if (s->frames_skipped) {
++		dstr_printf(&value, "%" PRIu64 " %s", s->frames_skipped, obs_module_text("SkippedFrames.Reason"));
++		add_info(props, "skipped", obs_module_text("SkippedFrames"), value.array, OBS_TEXT_INFO_NORMAL);
++	}
++	pthread_mutex_unlock(&s->mutex);
++	dstr_free(&value);
++
++	add_exposure_info(s, props);
++}
++
++static void reload_properties_task(void *param)
++{
++	obs_weak_source_t *weak = param;
++	obs_source_t *source = obs_weak_source_get_source(weak);
++
++	if (source) {
++		obs_source_update_properties(source);
++		obs_source_release(source);
++	}
++	obs_weak_source_release(weak);
++}
++
++/* As in the HDMI input source: reload asynchronously from the graphics thread. */
++static void reload_properties(struct camera_source *s)
++{
++	obs_queue_task(OBS_TASK_GRAPHICS, reload_properties_task, obs_source_get_weak_source(s->source), false);
++}
++
++static bool refresh_clicked(obs_properties_t *props, obs_property_t *p, void *data)
++{
++	UNUSED_PARAMETER(props);
++	UNUSED_PARAMETER(p);
++	reload_properties(data);
++	return false;
++}
++
++static bool connect_clicked(obs_properties_t *props, obs_property_t *p, void *data)
++{
++	struct camera_source *s = data;
++	UNUSED_PARAMETER(props);
++	UNUSED_PARAMETER(p);
++
++	s->disconnected = !s->disconnected;
++	if (s->disconnected) {
++		stop_capture(s);
++		blog_s(s, LOG_INFO, "Disconnected");
++	} else {
++		blog_s(s, LOG_INFO, "Connecting");
++		start_capture(s);
++	}
++	reload_properties(s);
++	return false;
++}
++
++static bool exposure_auto_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
++{
++	UNUSED_PARAMETER(p);
++	bool manual = !obs_data_get_bool(settings, "exposure_auto");
++	obs_property_set_visible(obs_properties_get(props, "shutter"), manual);
++	obs_property_set_visible(obs_properties_get(props, "gain"), manual);
++	return true;
++}
++
++static bool wb_auto_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
++{
++	UNUSED_PARAMETER(p);
++	obs_property_set_visible(obs_properties_get(props, "wb_ct"), !obs_data_get_bool(settings, "wb_auto"));
++	return true;
++}
++
++static void add_resolution(obs_property_t *list, uint32_t w, uint32_t h, uint32_t max_w, uint32_t max_h)
++{
++	struct dstr value = {0};
++	if (w > max_w || h > max_h) {
++		return;
++	}
++	dstr_printf(&value, "%ux%u", w, h);
++	obs_property_list_add_string(list, value.array, value.array);
++	dstr_free(&value);
++}
++
++static obs_properties_t *camera_properties(void *data)
++{
++	struct camera_source *s = data;
++	obs_properties_t *props = obs_properties_create();
++	obs_property_t *p;
++
++	struct list_cameras cams = {.sensor = s && s->sensor && *s->sensor ? s->sensor : NULL};
++	struct dstr label = {0};
++
++	p = obs_properties_add_list(props, "sensor", obs_module_text("Camera"), OBS_COMBO_TYPE_LIST,
++				    OBS_COMBO_FORMAT_STRING);
++	cams.list = p;
++	for_each_camera(list_camera_cb, &cams);
++	if (obs_property_list_item_count(p) == 0) {
++		obs_property_list_add_string(p, obs_module_text("NoCamera"), "");
++	}
++
++	/* The ISP's largest output (the sensor's active area) and its frame
++	 * rate; asked from the devices, so they show before capture starts. */
++	uint32_t max_w = 0, max_h = 0, sensor_w = 0, sensor_h = 0, max_fps = 0;
++	if (cams.path) {
++		int fd = open(cams.path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++		if (fd >= 0) {
++			isp_max_size(fd, &max_w, &max_h);
++			close(fd);
++		}
++		pthread_mutex_lock(&aiq_lock);
++		sensor_mode(cams.found_sensor, &sensor_w, &sensor_h, &max_fps);
++		pthread_mutex_unlock(&aiq_lock);
++	}
++
++	/* The ISP scales down, keeping 16:9 sensors at 16:9. */
++	p = obs_properties_add_list(props, "resolution", obs_module_text("Resolution"), OBS_COMBO_TYPE_LIST,
++				    OBS_COMBO_FORMAT_STRING);
++	if (max_w) {
++		dstr_printf(&label, "%s (%ux%u)", obs_module_text("Resolution.Full"), max_w, max_h);
++	} else {
++		dstr_copy(&label, obs_module_text("Resolution.Full"));
++		max_w = 3840;
++		max_h = 2160;
++	}
++	obs_property_list_add_string(p, label.array, "");
++	add_resolution(p, 2560, 1440, max_w, max_h);
++	add_resolution(p, 1920, 1080, max_w, max_h);
++	add_resolution(p, 1280, 720, max_w, max_h);
++
++	/* The sensor driver's mode sets the highest rate; rkaiq can only
++	 * lengthen frames from there. */
++	static const int rates[] = {120, 100, 90, 60, 50, 30, 25, 24, 20, 15};
++	p = obs_properties_add_list(props, "fps", obs_module_text("FrameRate"), OBS_COMBO_TYPE_LIST,
++				    OBS_COMBO_FORMAT_INT);
++	if (max_fps) {
++		dstr_printf(&label, "%s (%u fps)", obs_module_text("FrameRate.Sensor"), max_fps);
++	} else {
++		dstr_copy(&label, obs_module_text("FrameRate.Sensor"));
++		max_fps = 30;
++	}
++	obs_property_list_add_int(p, label.array, 0);
++	for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
++		if ((uint32_t)rates[i] < max_fps) {
++			dstr_printf(&label, "%d fps", rates[i]);
++			obs_property_list_add_int(p, label.array, rates[i]);
++		}
++	}
++	obs_property_list_add_int(p, obs_module_text("FrameRate.Variable"), -1);
++	dstr_free(&label);
++	bfree(cams.path);
++	bfree(cams.found_sensor);
++	obs_property_set_long_description(p, obs_module_text("FrameRate.Description"));
++
++	p = obs_properties_add_list(props, "antiflicker", obs_module_text("AntiFlicker"), OBS_COMBO_TYPE_LIST,
++				    OBS_COMBO_FORMAT_INT);
++	obs_property_list_add_int(p, obs_module_text("AntiFlicker.50"), 50);
++	obs_property_list_add_int(p, obs_module_text("AntiFlicker.60"), 60);
++	obs_property_list_add_int(p, obs_module_text("AntiFlicker.Off"), 0);
++	obs_property_set_long_description(p, obs_module_text("AntiFlicker.Description"));
++
++	p = obs_properties_add_bool(props, "exposure_auto", obs_module_text("ExposureAuto"));
++	obs_property_set_modified_callback(p, exposure_auto_changed);
++	/* Standard shutter speeds, up to one frame of the sensor's mode; 1/50
++	 * and 1/100 (1/60 and 1/120) don't flicker under 50 Hz (60 Hz) lights. */
++	static const int shutters[] = {15, 25, 30, 50, 60, 100, 120, 125, 250, 500, 1000, 2000, 4000, 8000};
++	p = obs_properties_add_list(props, "shutter", obs_module_text("ShutterSpeed"), OBS_COMBO_TYPE_LIST,
++				    OBS_COMBO_FORMAT_INT);
++	for (size_t i = 0; i < sizeof(shutters) / sizeof(shutters[0]); i++) {
++		if ((uint32_t)shutters[i] >= max_fps) {
++			struct dstr name = {0};
++			dstr_printf(&name, "1/%d s", shutters[i]);
++			obs_property_list_add_int(p, name.array, shutters[i]);
++			dstr_free(&name);
++		}
++	}
++	obs_property_set_long_description(p, obs_module_text("ShutterSpeed.Description"));
++	p = obs_properties_add_float_slider(props, "gain", obs_module_text("Gain"), 1.0, 64.0, 0.1);
++	obs_property_float_set_suffix(p, "x");
++
++	p = obs_properties_add_bool(props, "wb_auto", obs_module_text("WhiteBalanceAuto"));
++	obs_property_set_modified_callback(p, wb_auto_changed);
++	p = obs_properties_add_int_slider(props, "wb_ct", obs_module_text("ColorTemperature"), 2800, 7500, 100);
++	obs_property_int_set_suffix(p, " K");
++
++	obs_properties_add_int_slider(props, "brightness", obs_module_text("Brightness"), 0, 255, 1);
++	obs_properties_add_int_slider(props, "contrast", obs_module_text("Contrast"), 0, 255, 1);
++	obs_properties_add_int_slider(props, "saturation", obs_module_text("Saturation"), 0, 255, 1);
++	obs_properties_add_int_slider(props, "hue", obs_module_text("Hue"), 0, 255, 1);
++	obs_properties_add_int_slider(props, "sharpness", obs_module_text("Sharpness"), 0, 100, 1);
++	obs_properties_add_bool(props, "mirror", obs_module_text("Mirror"));
++	obs_properties_add_bool(props, "flip", obs_module_text("Flip"));
++
++	if (s) {
++		add_camera_info(s, props);
++		const char *connect = obs_module_text(s->disconnected ? "Connect" : "Disconnect");
++		obs_properties_add_button2(props, "connect", connect, connect_clicked, s);
++		obs_properties_add_button2(props, "refresh", obs_module_text("Refresh"), refresh_clicked, s);
++	}
++	return props;
++}
++
++static struct obs_source_info camera_source_info = {
++	.id = "rockchip_camera_source",
++	.type = OBS_SOURCE_TYPE_INPUT,
++	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_DO_NOT_DUPLICATE,
++	.get_name = camera_get_name,
++	.create = camera_create,
++	.destroy = camera_destroy,
++	.update = camera_update,
++	.get_defaults = camera_defaults,
++	.get_properties = camera_properties,
++	.video_tick = camera_tick,
++	.video_render = camera_render,
++	.get_width = camera_get_width,
++	.get_height = camera_get_height,
++	.icon_type = OBS_ICON_TYPE_CAMERA,
++};
++
++bool obs_module_load(void)
++{
++	obs_register_source(&camera_source_info);
++	return true;
++}

@@ -14,9 +14,11 @@ JF_PLAIN="${JF_VERSION#v}"
 # ('-' in an OBS pre-release becomes '~' so it sorts before the final release.)
 DEB_VERSION="${OBS_VERSION//-/\~}+jf${JF_PLAIN//-/.}-1~${CODENAME}"
 
-group "Bundle jellyfin-ffmpeg runtime"
-mkdir -p "$STAGE$FFMPEG_PREFIX"
+group "Bundle jellyfin-ffmpeg and rkaiq runtime"
+mkdir -p "$STAGE$FFMPEG_PREFIX/share"
 cp -dR --preserve=mode "$FFMPEG_PREFIX/lib" "$FFMPEG_PREFIX/bin" "$STAGE$FFMPEG_PREFIX/"
+# The camera sensors' tuning files, read by rkaiq at runtime.
+cp -dR --preserve=mode "$FFMPEG_PREFIX/share/rkaiq" "$STAGE$FFMPEG_PREFIX/share/"
 # Development files are only needed to build OBS itself.
 rm -rf "$STAGE$FFMPEG_PREFIX/lib/pkgconfig" "$STAGE$FFMPEG_PREFIX/lib/cmake"
 find "$STAGE$FFMPEG_PREFIX" -name '*.a' -delete
@@ -35,6 +37,7 @@ source_url="${GITHUB_REPOSITORY:+https://github.com/$GITHUB_REPOSITORY}"
 : "${source_url:=the obs-jfmpp build repository}"
 sed "s|@SOURCE_URL@|$source_url|" "$REPO_ROOT/packaging/copyright" > "$DOC/copyright"
 cp "$SRC_DIR"/rkmpp/LICENSES/* "$DOC/rockchip-mpp/"
+cp "$SRC_DIR/rkaiq/NOTICE" "$DOC/NOTICE.rkaiq"
 cef_root="$(sed -n 's/^CEF_ROOT_DIR:PATH=//p' "$WORK_DIR/obs/CMakeCache.txt")"
 [[ -f "$cef_root/LICENSE.txt" ]] && cp "$cef_root/LICENSE.txt" "$DOC/LICENSE.cef"
 endgroup
@@ -70,8 +73,8 @@ for f in "${elfs[@]}"; do
     [[ -n "$(patchelf --print-rpath "$f")" ]] || patchelf --set-rpath '$ORIGIN' "$f"
     continue
   fi
-  # rockchip-hdmirx links librga directly for 10-bit HDMI input.
-  if patchelf --print-needed "$f" | grep -qE '^lib(avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample|rga)\.so'; then
+  # rockchip-hdmirx links librga directly for 10-bit HDMI input, rockchip-camera librkaiq.
+  if patchelf --print-needed "$f" | grep -qE '^lib(avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample|rga|rkaiq)\.so'; then
     patchelf --add-rpath "$FFMPEG_PREFIX/lib" "$f"
     echo "${f#"$STAGE"}"
   fi

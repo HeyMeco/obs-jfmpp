@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mecid <mecidi.cc@gmail.com>
+Date: Sun, 25 Oct 2026 09:23:23 +0100
+Subject: [PATCH] Fall back to normal scheduling when realtime threads are not
+ allowed
+
+The 3A threads ask for SCHED_RR with explicit scheduling. Without
+CAP_SYS_NICE, or with RT group scheduling and no realtime budget in the
+caller's cgroup (desktop sessions on the vendor 6.12 kernel), creating
+them fails and AE/AWB never run ("Thread(isp_3a_stats_poll) create
+fail"). Retry with the caller's scheduling instead.
+---
+ rkaiq/c_base/aiq_thpool.c   | 9 ++++++++-
+ rkaiq/c_base/aiq_thread.c   | 5 ++++-
+ rkaiq/xcore/xcam_thread.cpp | 7 ++++++-
+ 3 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/rkaiq/c_base/aiq_thpool.c b/rkaiq/c_base/aiq_thpool.c
+index 98ff984..2cc2ebd 100755
+--- a/rkaiq/c_base/aiq_thpool.c
++++ b/rkaiq/c_base/aiq_thpool.c
+@@ -385,7 +385,14 @@ static int thread_init(thpool_* thpool_p, struct thread** thread_p, int id) {
+                 strerror(ret));
+     }
+ 
+-    pthread_create(&(*thread_p)->pthread, &attr, (void* (*)(void*))thread_do, (*thread_p));
++    /* See xcam_thread.cpp: fall back to the caller's scheduling. */
++    if (pthread_create(&(*thread_p)->pthread, &attr, (void* (*)(void*))thread_do, (*thread_p)) != 0) {
++        pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED);
++        if (pthread_create(&(*thread_p)->pthread, &attr, (void* (*)(void*))thread_do, (*thread_p)) != 0) {
++            pthread_attr_destroy(&attr);
++            return -1;
++        }
++    }
+     pthread_detach((*thread_p)->pthread);
+     pthread_attr_destroy(&attr);
+ 
+diff --git a/rkaiq/c_base/aiq_thread.c b/rkaiq/c_base/aiq_thread.c
+index f63d1d9..37a400b 100644
+--- a/rkaiq/c_base/aiq_thread.c
++++ b/rkaiq/c_base/aiq_thread.c
+@@ -187,7 +187,10 @@ bool aiqThread_start(AiqThread_t* thread) {
+         }
+     }
+ 
+-    if (pthread_create(&thread->_thread_id, &attr, (void* (*)(void*))thread_func, thread) != 0) {
++    /* See xcam_thread.cpp: fall back to the caller's scheduling. */
++    if (pthread_create(&thread->_thread_id, &attr, (void* (*)(void*))thread_func, thread) != 0 &&
++        (pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED) != 0 ||
++         pthread_create(&thread->_thread_id, &attr, (void* (*)(void*))thread_func, thread) != 0)) {
+         pthread_attr_destroy(&attr);
+         aiqMutex_unlock(&thread->_mutex);
+         XCAM_LOG_ERROR("Thread(%s) create fail !", XCAM_STR(thread->_name));
+diff --git a/rkaiq/xcore/xcam_thread.cpp b/rkaiq/xcore/xcam_thread.cpp
+index 432a24b..60f8abd 100644
+--- a/rkaiq/xcore/xcam_thread.cpp
++++ b/rkaiq/xcore/xcam_thread.cpp
+@@ -154,7 +154,12 @@ bool Thread::start ()
+         }
+     }
+ 
+-    if (pthread_create(&_thread_id, &attr, (void* (*)(void*))thread_func, this) != 0) {
++    /* Realtime scheduling needs CAP_SYS_NICE or, with RT group scheduling,
++     * realtime budget in the caller's cgroup, which desktop sessions don't
++     * have. Fall back to the caller's scheduling instead of not running. */
++    if (pthread_create(&_thread_id, &attr, (void* (*)(void*))thread_func, this) != 0 &&
++        (pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED) != 0 ||
++         pthread_create(&_thread_id, &attr, (void* (*)(void*))thread_func, this) != 0)) {
+         pthread_attr_destroy(&attr);
+         XCAM_LOG_ERROR("Thread(%s) create fail !", XCAM_STR(_name));
+         return false;

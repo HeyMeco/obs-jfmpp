@@ -345,7 +345,7 @@ new file mode 100644
 index 0000000..3b2a1ec
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/rockchip-hdmirx.c
-@@ -0,0 +1,1985 @@
+@@ -0,0 +1,1989 @@
 +/*
 + * Rockchip HDMI input (rk_hdmirx) source.
 + *
@@ -1875,9 +1875,13 @@ index 0000000..3b2a1ec
 +	pthread_mutex_unlock(&s->mutex);
 +	s->audio_enabled = obs_data_get_bool(settings, "audio");
 +
-+	if (!*device) {
++	/* Device numbers move when other video devices appear (e.g. after
++	 * enabling a camera overlay), so a saved node that isn't the receiver
++	 * anymore is replaced by the receiver's current one. */
++	struct v4l2_capability cap;
++	if (!*device || !is_hdmirx(device, &cap)) {
 +		for_each_hdmirx(first_device_cb, &detected);
-+		device = detected ? detected : "";
++		device = detected ? detected : device;
 +	}
 +	if (s->thread_running && s->device && strcmp(s->device, device) == 0 && s->edid_setting == edid) {
 +		bfree(detected);

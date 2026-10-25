@@ -50,8 +50,11 @@ Upstream already installs `libobs.so.0` / `libobs-frontend-api.so.0` compatibili
     yourself take precedence. The OBS log records when this happens.
   - a **Rockchip HDMI Input** source for the RK3588 HDMI receiver (`rk_hdmirx`), see
     [below](#capturing-the-rk3588-hdmi-input).
+  - a **Rockchip Camera** source for MIPI CSI camera modules on the RK3588 ISP (e.g. the
+    Radxa Camera 4K), see [below](#capturing-an-rk3588-mipi-camera).
 - A private copy of jellyfin-ffmpeg (shared libraries plus `ffmpeg`/`ffprobe`),
-  Rockchip MPP (`librockchip_mpp`) and RGA (`librga`) in `/usr/lib/obs-jellyfin-ffmpeg`.
+  Rockchip MPP (`librockchip_mpp`), RGA (`librga`) and the camera 3A engine (`librkaiq`,
+  with the RK3588 sensor tuning files) in `/usr/lib/obs-jellyfin-ffmpeg`.
   OBS finds it through `RUNPATH`; the system FFmpeg is left untouched and nothing
   else on the system uses this copy.
 
@@ -95,7 +98,7 @@ is applied on install.
 
 The package also installs `/etc/apt/preferences.d/obs-jfmpp`, which pins `obs-studio` to
 versions containing `+jf` (priority 1001) so `apt upgrade` doesn't replace it with a newer distribution
-build (without the Rockchip encoders and HDMI input). Newer obs-jfmpp packages still install
+build (without the Rockchip encoders, HDMI input and camera source). Newer obs-jfmpp packages still install
 over it, and removing the package removes the pin.
 
 #### Troubleshooting "Failed to init MPP context: -1"
@@ -218,6 +221,58 @@ always uses the two RGA3 cores.
   wireplumber`. Don't add the HDMI-in device as *Audio Input Capture*; with the rule in place
   it isn't offered anymore. While PipeWire still holds the card, Properties say so.
 
+### Capturing an RK3588 MIPI camera
+
+Add **Sources → Rockchip Camera** for a camera module on one of the board's MIPI CSI ports,
+such as the Radxa Camera 4K (Sony IMX415). The camera's device tree overlay has to be
+enabled, e.g. with `armbian-config` or in `/boot/armbianEnv.txt`; the sensor then shows up in
+`dmesg` (`imx415 ...: Detected imx415`).
+
+These modules send raw sensor data, which the RK3588's ISP turns into a picture. The ISP
+needs Rockchip's 3A engine (rkaiq) to do that well: it reads the ISP's statistics every frame
+and sets the exposure, white balance, colour correction, lens shading, noise reduction and
+sharpening from a tuning file made for the sensor and lens. Without it the ISP's output is
+dark and green, which is what *Video Capture Device (V4L2)* shows for these cameras. The
+source runs rkaiq itself while it captures, so no extra service is needed. The package
+bundles rkaiq (AIQ v6.0x32, which matches the ISP driver of the vendor 6.1 and 6.12 kernels)
+and Rockchip's RK3588 tuning files.
+
+Like the HDMI input, the source never touches the pixels on the CPU: the ISP scales the
+picture to the chosen resolution and writes NV12, which the GPU imports from dma-bufs and
+converts to RGB in a shader.
+
+- **Camera** lists the sensors found behind the ISP, with their module name (e.g.
+  *imx415 (RADXA-CAMERA-4K), /dev/video11*).
+- **Resolution**: the full resolution (3840x2160 for the IMX415), or 2560x1440,
+  1920x1080 or 1280x720 scaled down by the ISP.
+- **Frame rate**: the sensor's rate (30 fps for the IMX415) by default, fixed so OBS gets a
+  steady stream. The sensor driver's mode sets the highest rate: the stock IMX415 driver has
+  no mode faster than 30 fps on the 4-lane connection, and rkaiq can only slow a mode down.
+  Lower fixed rates are available, and *Variable* lets the camera lengthen the
+  exposure in low light at the cost of a lower, changing frame rate.
+- **Anti-flicker** (50 Hz by default, as in Rockchip's tuning; 60 Hz in the Americas) keeps
+  mains-powered lights from causing rolling bands.
+- Automatic or manual **exposure** (shutter speed from 1/30 to 1/8000 s, and gain) and
+  **white balance** (colour temperature),
+  **brightness**, **contrast**, **saturation**, **hue**, **sharpness**, **mirror** and **flip**.
+  These apply immediately.
+- Properties show the camera module, the tuning file in use, the capture and sensor
+  resolution, the measured frame rate, the current exposure (e.g. *1/60 s, gain 2.40x*) and
+  white balance, how long the camera has been capturing and the dropped frames, as for the HDMI
+  input. **Disconnect** stops the camera until **Connect**.
+- The tuning file is picked by sensor, module and lens name from the device tree, as Rockchip's
+  own tools do: `<sensor>_<module>_<lens>.json` in `/usr/lib/obs-jellyfin-ffmpeg/share/rkaiq/iqfiles`.
+  The Radxa Camera 4K's file is Rockchip's IMX415 tuning (Radxa ships the same file under its
+  own name). For a module without its own file, the source uses another one for the same sensor
+  and says so in Properties; colours may be off, since lenses and IR filters differ.
+- When `rkaiq_3A_server` (from Rockchip's or Radxa's camera packages) is running, it already
+  runs the 3A engine for every ISP stream. The source then leaves it to the server and only
+  captures; the image settings don't apply then. Stop the server to use them.
+- rkaiq asks for realtime scheduling for its threads, which desktop sessions don't get on the
+  vendor 6.12 kernel (RT group scheduling); the bundled build falls back to normal scheduling
+  instead of running without exposure and white balance control.
+- Supported on the RK3588 (ISP 3.0). Only one source can use a camera at a time.
+
 ## Automation
 
 [`.github/workflows/build.yml`](.github/workflows/build.yml) runs only on a schedule and on
@@ -268,7 +323,8 @@ with the dependencies preinstalled; it is rebuilt only when `scripts/install-dep
 Everything worth keeping between runs stays in `_build/<distro>/`: sources, build
 directories, CEF, the ccache, and the installed jellyfin-ffmpeg (`ffmpeg-prefix/`, mounted at
 `/usr/lib/obs-jellyfin-ffmpeg`). So MPP, RGA and jellyfin-ffmpeg are only rebuilt when their
-version, the MPP/RGA branch heads or `build-ffmpeg.sh` change. CI does the same with
+version, the MPP/RGA branch heads or `build-ffmpeg.sh` change, and rkaiq when its branch head,
+`build-rkaiq.sh` or `patches/rkaiq` change. CI does the same with
 `actions/cache`. Delete `_build/<distro>` to start from scratch.
 
 On macOS, Colima with `--vm-type vz --mount-type virtiofs` is much faster than QEMU/sshfs.
@@ -281,6 +337,7 @@ Inside a Trixie/Resolute arm64 system or container you can run
 |--------|------|
 | `scripts/install-deps.sh` | apt build dependencies (no distro `libav*-dev`) |
 | `scripts/build-ffmpeg.sh` | Rockchip MPP + RGA, then jellyfin-ffmpeg with its patch series applied |
+| `scripts/build-rkaiq.sh` | Rockchip's camera 3A engine (rkaiq) for the RK3588 ISP with `patches/rkaiq`, plus the RK3588 tuning files |
 | `scripts/build-obs.sh` | applies `patches/obs-studio/<version>`, fetches and verifies CEF, builds OBS Studio against that FFmpeg, staged install |
 | `scripts/package-deb.sh` | bundles FFmpeg, computes `Depends` with `dpkg-shlibdeps`, builds the `.deb` |
 | `scripts/test-deb.sh` | installs the `.deb` and checks the rkmpp codecs and library resolution |
