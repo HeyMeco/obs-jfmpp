@@ -1,8 +1,8 @@
 diff --git a/plugins/obs-ffmpeg/CMakeLists.txt b/plugins/obs-ffmpeg/CMakeLists.txt
-index 7d37eeb..b91df3e 100644
+index 7d37eeb..c477a65 100644
 --- a/plugins/obs-ffmpeg/CMakeLists.txt
 +++ b/plugins/obs-ffmpeg/CMakeLists.txt
-@@ -7,6 +7,10 @@ if(OS_LINUX OR OS_WINDOWS)
+@@ -7,8 +7,16 @@ if(OS_LINUX OR OS_WINDOWS)
    option(ENABLE_FFMPEG_NVENC "Enable legacy FFmpeg NVENC encoder" OFF)
  endif()
  
@@ -12,8 +12,14 @@ index 7d37eeb..b91df3e 100644
 +
  include(cmake/dependencies.cmake)
  
++if(ENABLE_RKMPP)
++  find_package(OpenGL REQUIRED COMPONENTS EGL)
++endif()
++
  add_library(obs-ffmpeg MODULE)
-@@ -19,6 +23,7 @@ target_sources(
+ add_library(OBS::ffmpeg ALIAS obs-ffmpeg)
+ 
+@@ -19,6 +27,7 @@ target_sources(
    PRIVATE
      $<$<BOOL:${ENABLE_FFMPEG_LOGGING}>:obs-ffmpeg-logging.c>
      $<$<BOOL:${ENABLE_FFMPEG_NVENC}>:obs-ffmpeg-nvenc.c>
@@ -21,7 +27,7 @@ index 7d37eeb..b91df3e 100644
      $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:obs-ffmpeg-mpegts.c>
      $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:obs-ffmpeg-rist.h>
      $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:obs-ffmpeg-srt.h>
-@@ -47,6 +52,7 @@ target_compile_definitions(
+@@ -47,6 +56,7 @@ target_compile_definitions(
    PRIVATE
      $<$<BOOL:${ENABLE_FFMPEG_LOGGING}>:ENABLE_FFMPEG_LOGGING>
      $<$<BOOL:${ENABLE_FFMPEG_NVENC}>:ENABLE_FFMPEG_NVENC>
@@ -29,6 +35,14 @@ index 7d37eeb..b91df3e 100644
      $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:NEW_MPEGTS_OUTPUT>
  )
  
+@@ -69,6 +79,7 @@ target_link_libraries(
+     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:Libva::drm>
+     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:Libpci::pci>
+     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:Libdrm::Libdrm>
++    $<$<BOOL:${ENABLE_RKMPP}>:OpenGL::EGL>
+     $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:Librist::Librist>
+     $<$<BOOL:${ENABLE_NEW_MPEGTS_OUTPUT}>:Libsrt::Libsrt>
+ )
 diff --git a/plugins/obs-ffmpeg/data/locale/en-US.ini b/plugins/obs-ffmpeg/data/locale/en-US.ini
 index d74426c..aa75591 100644
 --- a/plugins/obs-ffmpeg/data/locale/en-US.ini
@@ -46,10 +60,10 @@ index d74426c..aa75591 100644
  H264.UnsupportedColorSpace="Only the Rec. 709 color space is supported."
 diff --git a/plugins/obs-ffmpeg/obs-ffmpeg-rkmpp.c b/plugins/obs-ffmpeg/obs-ffmpeg-rkmpp.c
 new file mode 100644
-index 0000000..c7800f9
+index 0000000..45c3df4
 --- /dev/null
 +++ b/plugins/obs-ffmpeg/obs-ffmpeg-rkmpp.c
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,617 @@
 +/******************************************************************************
 +    Rockchip MPP (rkmpp) H.264/HEVC encoders via jellyfin-ffmpeg.
 +
@@ -69,20 +83,43 @@ index 0000000..c7800f9
 +
 +#include "obs-ffmpeg-video-encoders.h"
 +
++#include <libavutil/hwcontext.h>
++#include <libavutil/hwcontext_drm.h>
++#include <EGL/egl.h>
++#include <drm_fourcc.h>
++
 +#define do_log(level, format, ...) \
 +	blog(level, "[rkmpp encoder: '%s'] " format, obs_encoder_get_name(enc->ffve.encoder), ##__VA_ARGS__)
 +
 +#define warn(format, ...) do_log(LOG_WARNING, format, ##__VA_ARGS__)
 +#define info(format, ...) do_log(LOG_INFO, format, ##__VA_ARGS__)
 +
++/* Frames the MPP frame pool can have in flight; each one is imported into the
++ * GPU once and reused. */
++#define RKMPP_MAX_SURFACES 16
++
 +enum rkmpp_codec {
 +	RKMPP_CODEC_H264,
 +	RKMPP_CODEC_HEVC,
 +};
 +
++/* An MPP frame buffer imported into the GPU as the NV12 planes OBS renders. */
++struct rkmpp_surface {
++	int fd;
++	gs_texture_t *tex[2];
++};
++
 +struct rkmpp_encoder {
 +	struct ffmpeg_video_encoder ffve;
 +	enum rkmpp_codec codec;
++
++	/* Texture encoding: OBS's NV12 output is copied on the GPU into dma-bufs
++	 * from MPP's frame pool, so no frame is read back to the CPU. */
++	bool texture;
++	AVBufferRef *hw_frames;
++	struct rkmpp_surface surfaces[RKMPP_MAX_SURFACES];
++	size_t num_surfaces;
++	bool sync_warned;
 +
 +	DARRAY(uint8_t) header;
 +};
@@ -106,6 +143,93 @@ index 0000000..c7800f9
 +
 +	if (info->format != VIDEO_FORMAT_NV12 && info->format != VIDEO_FORMAT_I420)
 +		info->format = VIDEO_FORMAT_NV12;
++}
++
++/* The encoder takes DRM PRIME frames from an MPP frame pool instead of
++ * copying system memory frames into one. */
++static bool rkmpp_init_hw_frames(struct rkmpp_encoder *enc)
++{
++	AVCodecContext *context = enc->ffve.context;
++	AVBufferRef *device = NULL;
++	int ret;
++
++	ret = av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_RKMPP, NULL, NULL, 0);
++	if (ret < 0) {
++		warn("Failed to create the MPP device: %s", av_err2str(ret));
++		return false;
++	}
++
++	enc->hw_frames = av_hwframe_ctx_alloc(device);
++	av_buffer_unref(&device);
++	if (!enc->hw_frames) {
++		warn("Failed to allocate the MPP frame pool");
++		return false;
++	}
++
++	AVHWFramesContext *frames = (AVHWFramesContext *)enc->hw_frames->data;
++	frames->format = AV_PIX_FMT_DRM_PRIME;
++	frames->sw_format = AV_PIX_FMT_NV12;
++	frames->width = context->width;
++	frames->height = context->height;
++
++	ret = av_hwframe_ctx_init(enc->hw_frames);
++	if (ret < 0) {
++		warn("Failed to initialize the MPP frame pool: %s", av_err2str(ret));
++		return false;
++	}
++
++	context->pix_fmt = AV_PIX_FMT_DRM_PRIME;
++	context->sw_pix_fmt = AV_PIX_FMT_NV12;
++	context->hw_frames_ctx = av_buffer_ref(enc->hw_frames);
++	return context->hw_frames_ctx != NULL;
++}
++
++/* Called inside the graphics context. */
++static struct rkmpp_surface *rkmpp_get_surface(struct rkmpp_encoder *enc, const AVDRMFrameDescriptor *desc)
++{
++	const AVDRMLayerDescriptor *layer = &desc->layers[0];
++	struct rkmpp_surface *surface;
++	int fd = desc->objects[0].fd;
++
++	for (size_t i = 0; i < enc->num_surfaces; i++) {
++		if (enc->surfaces[i].fd == fd)
++			return &enc->surfaces[i];
++	}
++
++	if (enc->num_surfaces == RKMPP_MAX_SURFACES) {
++		warn("Too many frames in flight");
++		return NULL;
++	}
++	if (desc->nb_objects != 1 || desc->nb_layers != 1 || layer->nb_planes != 2) {
++		warn("Unexpected MPP frame layout");
++		return NULL;
++	}
++
++	uint32_t width = (uint32_t)enc->ffve.context->width;
++	uint32_t height = (uint32_t)enc->ffve.context->height;
++	uint64_t modifier = desc->objects[0].format_modifier;
++	static const uint32_t drm_formats[2] = {DRM_FORMAT_R8, DRM_FORMAT_GR88};
++	static const enum gs_color_format gs_formats[2] = {GS_R8, GS_R8G8};
++
++	surface = &enc->surfaces[enc->num_surfaces];
++	surface->fd = fd;
++	for (int p = 0; p < 2; p++) {
++		uint32_t pitch = (uint32_t)layer->planes[p].pitch;
++		uint32_t offset = (uint32_t)layer->planes[p].offset;
++
++		surface->tex[p] = gs_texture_create_from_dmabuf(p ? width / 2 : width, p ? height / 2 : height,
++								drm_formats[p], gs_formats[p], 1, &fd, &pitch,
++								&offset, &modifier);
++		if (!surface->tex[p]) {
++			warn("Failed to import an MPP frame into the GPU");
++			gs_texture_destroy(surface->tex[0]);
++			surface->tex[0] = NULL;
++			return NULL;
++		}
++	}
++
++	enc->num_surfaces++;
++	return surface;
 +}
 +
 +static bool rkmpp_update(struct rkmpp_encoder *enc, obs_data_t *settings)
@@ -157,6 +281,7 @@ index 0000000..c7800f9
 +
 +	info("settings:\n"
 +	     "\tencoder:      %s\n"
++	     "\tinput:        %s\n"
 +	     "\trate_control: %s\n"
 +	     "\tbitrate:      %d\n"
 +	     "\tmax_bitrate:  %d\n"
@@ -166,11 +291,14 @@ index 0000000..c7800f9
 +	     "\twidth:        %d\n"
 +	     "\theight:       %d\n"
 +	     "\tffmpeg opts:  %s\n",
-+	     enc->ffve.enc_name, rc, bitrate, max_bitrate, cqp, enc->ffve.context->gop_size, profile,
++	     enc->ffve.enc_name, enc->texture ? "GPU texture (zero-copy)" : "system memory", rc, bitrate, max_bitrate, cqp, enc->ffve.context->gop_size, profile,
 +	     enc->ffve.context->width, enc->ffve.height, ffmpeg_opts);
 +
 +	/* SPS/PPS(/VPS) go into extradata instead of in front of every IDR */
 +	enc->ffve.context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
++
++	if (enc->texture && !rkmpp_init_hw_frames(enc))
++		return false;
 +	if (!ffmpeg_video_encoder_init_codec(&enc->ffve))
 +		return false;
 +
@@ -200,13 +328,23 @@ index 0000000..c7800f9
 +{
 +	struct rkmpp_encoder *enc = data;
 +
++	if (enc->num_surfaces) {
++		obs_enter_graphics();
++		for (size_t i = 0; i < enc->num_surfaces; i++) {
++			gs_texture_destroy(enc->surfaces[i].tex[0]);
++			gs_texture_destroy(enc->surfaces[i].tex[1]);
++		}
++		obs_leave_graphics();
++	}
++
 +	ffmpeg_video_encoder_free(&enc->ffve);
++	av_buffer_unref(&enc->hw_frames);
 +	da_free(enc->header);
 +	bfree(enc);
 +}
 +
 +static void *rkmpp_create_internal(obs_data_t *settings, obs_encoder_t *encoder, enum rkmpp_codec codec,
-+				   const char *enc_lib, const char *enc_name)
++				   const char *enc_lib, const char *enc_name, bool texture)
 +{
 +	video_t *video = obs_encoder_video(encoder);
 +	const struct video_output_info *voi = video_output_get_info(video);
@@ -220,6 +358,7 @@ index 0000000..c7800f9
 +
 +	struct rkmpp_encoder *enc = bzalloc(sizeof(*enc));
 +	enc->codec = codec;
++	enc->texture = texture;
 +
 +	if (!ffmpeg_video_encoder_init(&enc->ffve, enc, encoder, enc_lib, NULL, enc_name, rkmpp_on_init_error, NULL))
 +		goto fail;
@@ -233,14 +372,60 @@ index 0000000..c7800f9
 +	return NULL;
 +}
 +
++/* Imports one frame of the pool, so a GPU that can't render into MPP's
++ * buffers falls back to system memory frames before the output starts. */
++static bool rkmpp_test_texture(struct rkmpp_encoder *enc)
++{
++	AVFrame *frame = av_frame_alloc();
++	bool success = false;
++
++	if (frame && av_hwframe_get_buffer(enc->hw_frames, frame, 0) == 0) {
++		obs_enter_graphics();
++		success = rkmpp_get_surface(enc, (const AVDRMFrameDescriptor *)frame->data[0]) != NULL;
++		obs_leave_graphics();
++	}
++	av_frame_free(&frame);
++	return success;
++}
++
++static void *rkmpp_create_tex_internal(obs_data_t *settings, obs_encoder_t *encoder, enum rkmpp_codec codec,
++				       const char *enc_lib, const char *enc_name, const char *fallback)
++{
++	/* OBS only hands out NV12 textures when it renders NV12. */
++	if (obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_NV12)) {
++		struct rkmpp_encoder *enc = rkmpp_create_internal(settings, encoder, codec, enc_lib, enc_name, true);
++		if (enc && rkmpp_test_texture(enc))
++			return enc;
++		if (enc)
++			rkmpp_destroy(enc);
++		if (obs_encoder_get_last_error(encoder))
++			return NULL;
++	}
++
++	blog(LOG_INFO, "[rkmpp encoder] Texture encoding unavailable, using system memory frames");
++	return obs_encoder_create_rerouted(encoder, fallback);
++}
++
 +static void *h264_rkmpp_create(obs_data_t *settings, obs_encoder_t *encoder)
 +{
-+	return rkmpp_create_internal(settings, encoder, RKMPP_CODEC_H264, "h264_rkmpp", "Rockchip MPP H.264");
++	return rkmpp_create_internal(settings, encoder, RKMPP_CODEC_H264, "h264_rkmpp", "Rockchip MPP H.264", false);
 +}
 +
 +static void *hevc_rkmpp_create(obs_data_t *settings, obs_encoder_t *encoder)
 +{
-+	return rkmpp_create_internal(settings, encoder, RKMPP_CODEC_HEVC, "hevc_rkmpp", "Rockchip MPP HEVC");
++	return rkmpp_create_internal(settings, encoder, RKMPP_CODEC_HEVC, "hevc_rkmpp", "Rockchip MPP HEVC", false);
++}
++
++static void *h264_rkmpp_create_tex(obs_data_t *settings, obs_encoder_t *encoder)
++{
++	return rkmpp_create_tex_internal(settings, encoder, RKMPP_CODEC_H264, "h264_rkmpp", "Rockchip MPP H.264",
++					 "ffmpeg_rkmpp_h264_soft");
++}
++
++static void *hevc_rkmpp_create_tex(obs_data_t *settings, obs_encoder_t *encoder)
++{
++	return rkmpp_create_tex_internal(settings, encoder, RKMPP_CODEC_HEVC, "hevc_rkmpp", "Rockchip MPP HEVC",
++					 "ffmpeg_rkmpp_hevc_soft");
 +}
 +
 +static bool rkmpp_encode(void *data, struct encoder_frame *frame, struct encoder_packet *packet,
@@ -248,6 +433,98 @@ index 0000000..c7800f9
 +{
 +	struct rkmpp_encoder *enc = data;
 +	return ffmpeg_video_encode(&enc->ffve, frame, packet, received_packet);
++}
++
++/* Mesa copies into imported linear buffers on the CPU (gs_copy_texture takes
++ * ~20 ms per 4K frame on Panthor), so draw the plane instead. Called inside
++ * the graphics context. */
++static void rkmpp_draw_plane(gs_texture_t *dst, gs_texture_t *src)
++{
++	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
++	gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
++	uint32_t width = gs_texture_get_width(dst);
++	uint32_t height = gs_texture_get_height(dst);
++	gs_texture_t *prev_target = gs_get_render_target();
++	gs_zstencil_t *prev_zs = gs_get_zstencil_target();
++	const bool prev_srgb = gs_framebuffer_srgb_enabled();
++
++	gs_viewport_push();
++	gs_projection_push();
++	gs_blend_state_push();
++	gs_enable_framebuffer_srgb(false);
++	gs_enable_blending(false);
++	gs_set_render_target(dst, NULL);
++	gs_set_viewport(0, 0, (int)width, (int)height);
++	gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
++
++	gs_effect_set_texture(image, src);
++	while (gs_effect_loop(effect, "Draw"))
++		gs_draw_sprite(src, 0, width, height);
++
++	gs_set_render_target(prev_target, prev_zs);
++	gs_enable_framebuffer_srgb(prev_srgb);
++	gs_blend_state_pop();
++	gs_projection_pop();
++	gs_viewport_pop();
++}
++
++static bool rkmpp_encode_tex(void *data, struct encoder_texture *texture, int64_t pts, uint64_t lock_key,
++			     uint64_t *next_key, struct encoder_packet *packet, bool *received_packet)
++{
++	UNUSED_PARAMETER(lock_key);
++	UNUSED_PARAMETER(next_key);
++
++	struct rkmpp_encoder *enc = data;
++	struct rkmpp_surface *surface = NULL;
++	EGLDisplay display = EGL_NO_DISPLAY;
++	EGLSync sync = EGL_NO_SYNC;
++	AVFrame *frame;
++	bool success = false;
++	int ret;
++
++	*received_packet = false;
++
++	frame = av_frame_alloc();
++	if (!frame)
++		return false;
++	ret = av_hwframe_get_buffer(enc->hw_frames, frame, 0);
++	if (ret < 0) {
++		warn("Failed to get an MPP frame: %s", av_err2str(ret));
++		goto out;
++	}
++
++	obs_enter_graphics();
++	if (texture->tex[0] && texture->tex[1])
++		surface = rkmpp_get_surface(enc, (const AVDRMFrameDescriptor *)frame->data[0]);
++	if (surface) {
++		rkmpp_draw_plane(surface->tex[0], texture->tex[0]);
++		rkmpp_draw_plane(surface->tex[1], texture->tex[1]);
++		display = eglGetCurrentDisplay();
++		sync = eglCreateSync(display, EGL_SYNC_FENCE, NULL);
++		gs_flush();
++	}
++	obs_leave_graphics();
++
++	if (!surface)
++		goto out;
++
++	/* MPP reads the buffer as soon as it gets the frame and doesn't wait for
++	 * the GPU, so wait here, outside the graphics lock. */
++	if (sync != EGL_NO_SYNC) {
++		eglClientWaitSync(display, sync, 0, 1000000000);
++		eglDestroySync(display, sync);
++	} else if (!enc->sync_warned) {
++		warn("Unable to create a GPU fence; frames may tear");
++		enc->sync_warned = true;
++	}
++
++	av_frame_copy_props(frame, enc->ffve.vframe);
++	frame->pts = pts;
++	success = ffmpeg_video_encode_avframe(&enc->ffve, frame, packet, received_packet);
++
++out:
++	av_frame_free(&frame);
++	return success;
 +}
 +
 +static void rkmpp_defaults_internal(obs_data_t *settings, const char *profile)
@@ -350,6 +627,21 @@ index 0000000..c7800f9
 +	.type = OBS_ENCODER_VIDEO,
 +	.codec = "h264",
 +	.get_name = h264_rkmpp_getname,
++	.create = h264_rkmpp_create_tex,
++	.destroy = rkmpp_destroy,
++	.encode_texture2 = rkmpp_encode_tex,
++	.get_defaults = h264_rkmpp_defaults,
++	.get_properties = h264_rkmpp_properties,
++	.get_extra_data = rkmpp_extra_data,
++	.get_video_info = rkmpp_video_info,
++	.caps = OBS_ENCODER_CAP_PASS_TEXTURE,
++};
++
++struct obs_encoder_info h264_rkmpp_soft_encoder_info = {
++	.id = "ffmpeg_rkmpp_h264_soft",
++	.type = OBS_ENCODER_VIDEO,
++	.codec = "h264",
++	.get_name = h264_rkmpp_getname,
 +	.create = h264_rkmpp_create,
 +	.destroy = rkmpp_destroy,
 +	.encode = rkmpp_encode,
@@ -357,10 +649,26 @@ index 0000000..c7800f9
 +	.get_properties = h264_rkmpp_properties,
 +	.get_extra_data = rkmpp_extra_data,
 +	.get_video_info = rkmpp_video_info,
++	.caps = OBS_ENCODER_CAP_INTERNAL,
 +};
 +
 +struct obs_encoder_info hevc_rkmpp_encoder_info = {
 +	.id = "ffmpeg_rkmpp_hevc",
++	.type = OBS_ENCODER_VIDEO,
++	.codec = "hevc",
++	.get_name = hevc_rkmpp_getname,
++	.create = hevc_rkmpp_create_tex,
++	.destroy = rkmpp_destroy,
++	.encode_texture2 = rkmpp_encode_tex,
++	.get_defaults = hevc_rkmpp_defaults,
++	.get_properties = hevc_rkmpp_properties,
++	.get_extra_data = rkmpp_extra_data,
++	.get_video_info = rkmpp_video_info,
++	.caps = OBS_ENCODER_CAP_PASS_TEXTURE,
++};
++
++struct obs_encoder_info hevc_rkmpp_soft_encoder_info = {
++	.id = "ffmpeg_rkmpp_hevc_soft",
 +	.type = OBS_ENCODER_VIDEO,
 +	.codec = "hevc",
 +	.get_name = hevc_rkmpp_getname,
@@ -371,12 +679,74 @@ index 0000000..c7800f9
 +	.get_properties = hevc_rkmpp_properties,
 +	.get_extra_data = rkmpp_extra_data,
 +	.get_video_info = rkmpp_video_info,
++	.caps = OBS_ENCODER_CAP_INTERNAL,
 +};
+diff --git a/plugins/obs-ffmpeg/obs-ffmpeg-video-encoders.c b/plugins/obs-ffmpeg/obs-ffmpeg-video-encoders.c
+index 90cddb8..246c255 100644
+--- a/plugins/obs-ffmpeg/obs-ffmpeg-video-encoders.c
++++ b/plugins/obs-ffmpeg/obs-ffmpeg-video-encoders.c
+@@ -46,10 +46,14 @@ bool ffmpeg_video_encoder_init_codec(struct ffmpeg_video_encoder *enc)
+ 	enc->vframe->colorspace = enc->context->colorspace;
+ 	enc->vframe->chroma_location = enc->context->chroma_sample_location;
+ 
+-	ret = av_frame_get_buffer(enc->vframe, base_get_alignment());
+-	if (ret < 0) {
+-		warn("Failed to allocate vframe: %s", av_err2str(ret));
+-		return false;
++	/* Hardware frames (texture encoders) come from the encoder's frame pool. */
++	const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(enc->context->pix_fmt);
++	if (!desc || !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
++		ret = av_frame_get_buffer(enc->vframe, base_get_alignment());
++		if (ret < 0) {
++			warn("Failed to allocate vframe: %s", av_err2str(ret));
++			return false;
++		}
+ 	}
+ 
+ 	enc->initialized = true;
+@@ -203,6 +207,15 @@ static inline void copy_data(AVFrame *pic, const struct encoder_frame *frame, in
+ 
+ bool ffmpeg_video_encode(struct ffmpeg_video_encoder *enc, struct encoder_frame *frame, struct encoder_packet *packet,
+ 			 bool *received_packet)
++{
++	copy_data(enc->vframe, frame, enc->height, enc->context->pix_fmt);
++
++	enc->vframe->pts = frame->pts;
++	return ffmpeg_video_encode_avframe(enc, enc->vframe, packet, received_packet);
++}
++
++bool ffmpeg_video_encode_avframe(struct ffmpeg_video_encoder *enc, AVFrame *frame, struct encoder_packet *packet,
++				 bool *received_packet)
+ {
+ 	AVPacket av_pkt = {0};
+ 	bool timeout = false;
+@@ -214,10 +227,7 @@ bool ffmpeg_video_encode(struct ffmpeg_video_encoder *enc, struct encoder_frame
+ 	if (!enc->start_ts)
+ 		enc->start_ts = cur_ts;
+ 
+-	copy_data(enc->vframe, frame, enc->height, enc->context->pix_fmt);
+-
+-	enc->vframe->pts = frame->pts;
+-	ret = avcodec_send_frame(enc->context, enc->vframe);
++	ret = avcodec_send_frame(enc->context, frame);
+ 	if (ret == 0)
+ 		ret = avcodec_receive_packet(enc->context, &av_pkt);
+ 
+diff --git a/plugins/obs-ffmpeg/obs-ffmpeg-video-encoders.h b/plugins/obs-ffmpeg/obs-ffmpeg-video-encoders.h
+index 7d9d90b..78d7c4b 100644
+--- a/plugins/obs-ffmpeg/obs-ffmpeg-video-encoders.h
++++ b/plugins/obs-ffmpeg/obs-ffmpeg-video-encoders.h
+@@ -48,3 +48,5 @@ extern void ffmpeg_video_encoder_update(struct ffmpeg_video_encoder *enc, int bi
+ 					const char *ffmpeg_opts);
+ extern bool ffmpeg_video_encode(struct ffmpeg_video_encoder *enc, struct encoder_frame *frame,
+ 				struct encoder_packet *packet, bool *received_packet);
++extern bool ffmpeg_video_encode_avframe(struct ffmpeg_video_encoder *enc, AVFrame *frame,
++					struct encoder_packet *packet, bool *received_packet);
 diff --git a/plugins/obs-ffmpeg/obs-ffmpeg.c b/plugins/obs-ffmpeg/obs-ffmpeg.c
-index d7880e5..61ddd7a 100644
+index d7880e5..00ab7d2 100644
 --- a/plugins/obs-ffmpeg/obs-ffmpeg.c
 +++ b/plugins/obs-ffmpeg/obs-ffmpeg.c
-@@ -323,6 +323,35 @@ static bool hevc_vaapi_supported(void)
+@@ -323,6 +323,37 @@ static bool hevc_vaapi_supported(void)
  #endif
  #endif
  
@@ -386,6 +756,8 @@ index d7880e5..61ddd7a 100644
 +
 +extern struct obs_encoder_info h264_rkmpp_encoder_info;
 +extern struct obs_encoder_info hevc_rkmpp_encoder_info;
++extern struct obs_encoder_info h264_rkmpp_soft_encoder_info;
++extern struct obs_encoder_info hevc_rkmpp_soft_encoder_info;
 +
 +/* The MPP kernel driver exposes one of these depending on the BSP kernel. */
 +static bool rkmpp_device_available(void)
@@ -412,7 +784,7 @@ index d7880e5..61ddd7a 100644
  #if defined(_WIN32) && !defined(_M_ARM64)
  extern void amf_load(void);
  extern void amf_unload(void);
-@@ -411,6 +440,19 @@ bool obs_module_load(void)
+@@ -411,6 +442,21 @@ bool obs_module_load(void)
  #endif
  #endif
  
@@ -424,6 +796,8 @@ index d7880e5..61ddd7a 100644
 +		blog(LOG_INFO, "Rockchip MPP device found");
 +		register_encoder_if_available(&h264_rkmpp_encoder_info, "h264_rkmpp");
 +		register_encoder_if_available(&hevc_rkmpp_encoder_info, "hevc_rkmpp");
++		register_encoder_if_available(&h264_rkmpp_soft_encoder_info, "h264_rkmpp");
++		register_encoder_if_available(&hevc_rkmpp_soft_encoder_info, "hevc_rkmpp");
 +	} else {
 +		blog(LOG_INFO, "Rockchip MPP encoding not supported (no MPP device)");
 +	}

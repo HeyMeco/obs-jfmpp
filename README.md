@@ -74,7 +74,11 @@ Not included: NVENC, QSV, AJA, WebRTC output, fdk-aac.
   (0 = 2 s), profile, plus free-form FFmpeg options passed to `h264_rkmpp`/`hevc_rkmpp`
   (e.g. `qp_min=20 qp_max=40`).
 
-OBS feeds the encoder 8-bit NV12/I420 frames; HDR (Rec. 2100) output isn't supported. The
+The encoders take OBS's frames straight from the GPU: OBS renders NV12, which is drawn into
+MPP's own frame buffers and encoded from there, so no frame is read back to the CPU. Reading
+frames back is slow on the Mali GPU (4K60 recordings dropped more than half their frames to
+rendering lag that way). With an I420 color format OBS hands over system memory frames
+instead. Input is 8-bit only; HDR (Rec. 2100) output isn't supported. The
 encoders only show up when an MPP device node (`/dev/mpp_service`, `/dev/vpu_service`,
 `/dev/rkvenc` or `/dev/vepu`) exists. A profile set to an rkmpp encoder falls back to x264 on
 machines without one.
@@ -146,7 +150,10 @@ always uses the two RGA3 cores.
   reconnected, the source restarts by itself; while there is no signal it is empty.
 - The source's Properties window shows the signal: resolution, frame rate, pixel clock,
   pixel format, colorimetry and range, whether it is HDR, the receiver's EDID, the conversion path (including the RGA3 time per frame
-  for 10-bit signals), the GPU textures, and the captured/dropped frame counts. Without a
+  for 10-bit signals), the GPU textures, and the frame counts. *Dropped* counts frames lost
+  although OBS could have shown them, *skipped* counts frames left out because the signal runs
+  faster than the OBS frame rate (e.g. 120 Hz into a 60 FPS canvas). Frames OBS itself misses
+  to rendering lag show up in OBS's stats, not here. Without a
   signal it shows why, e.g. *No HDMI signal*. It updates by itself when the signal changes;
   **Refresh** updates the frame and timing counts. **Disconnect** stops capturing and
   closes the receiver's video and audio devices so other programs can use them, until

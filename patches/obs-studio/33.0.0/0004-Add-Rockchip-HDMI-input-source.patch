@@ -184,10 +184,10 @@ index 0000000..e41bbe4
 +}
 diff --git a/plugins/rockchip-hdmirx/data/locale/en-US.ini b/plugins/rockchip-hdmirx/data/locale/en-US.ini
 new file mode 100644
-index 0000000..e237fc1
+index 0000000..11a385e
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/data/locale/en-US.ini
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,48 @@
 +RockchipHdmiRx="Rockchip HDMI Input"
 +Device="Device"
 +NoDevice="No Rockchip HDMI input found"
@@ -204,6 +204,7 @@ index 0000000..e237fc1
 +Frames="Frames"
 +Captured="captured"
 +Dropped="dropped"
++Skipped="skipped (signal faster than OBS)"
 +Refresh="Refresh"
 +Conversion="Conversion"
 +GpuTextures="GPU textures"
@@ -341,10 +342,10 @@ index 0000000..81a140b
 +};
 diff --git a/plugins/rockchip-hdmirx/rockchip-hdmirx.c b/plugins/rockchip-hdmirx/rockchip-hdmirx.c
 new file mode 100644
-index 0000000..3b2a1ec
+index 0000000..8476741
 --- /dev/null
 +++ b/plugins/rockchip-hdmirx/rockchip-hdmirx.c
-@@ -0,0 +1,1985 @@
+@@ -0,0 +1,2047 @@
 +/*
 + * Rockchip HDMI input (rk_hdmirx) source.
 + *
@@ -417,6 +418,10 @@ index 0000000..3b2a1ec
 +/* Ticks a buffer stays out of the queue after it was last drawn, so the GPU
 + * has finished reading it before the receiver writes into it again. */
 +#define RETIRE_TICKS 3
++/* Captured frames waiting for video_tick. Two absorb the jitter between the
++ * HDMI and OBS clocks (two frames landing between ticks) and a late tick
++ * without adding latency in steady state. */
++#define MAX_QUEUED 2
 +#define NO_FRAME_TIMEOUT_MS 2000
 +#define RETRY_MS 1000
 +/* Signal lock after a receiver reset takes about 2.5 s. */
@@ -507,7 +512,7 @@ index 0000000..3b2a1ec
 +struct hdmirx_buffer {
 +	int dmabuf[VIDEO_MAX_PLANES];
 +	gs_texture_t *tex[2];
-+	int retire_age; /* -1 while queued, displayed or ready */
++	int retire_age; /* -1 while queued in the driver, displayed or waiting for tick */
 +
 +	int gpu_dmabuf; /* RGA output, -1 when the GPU reads the capture buffer */
 +#ifdef HAVE_RGA
@@ -543,7 +548,8 @@ index 0000000..3b2a1ec
 +	struct v4l2_bt_timings timings;
 +	struct hdmirx_buffer buffers[MAX_BUFFERS];
 +	uint32_t num_buffers;
-+	int ready;     /* newest captured buffer, not yet picked up by tick */
++	int queue[MAX_QUEUED]; /* captured buffers not yet picked up by tick, oldest first */
++	uint32_t queued;
 +	int displayed; /* buffer drawn by video_render */
 +	bool import_failed;
 +	float color_matrix[16];
@@ -555,7 +561,9 @@ index 0000000..3b2a1ec
 +	bool decode_pq;   /* setting: decode PQ to linear Rec. 709, else pass it through */
 +	uint16_t max_cll; /* content light level from the infoframe, 0 if unknown */
 +	uint64_t frames_captured;
-+	uint64_t frames_dropped; /* replaced before video_tick picked them up */
++	uint64_t frames_dropped; /* lost although OBS could have shown them */
++	uint64_t frames_skipped; /* left out because the signal is faster than OBS */
++	uint64_t last_tick_ns;
 +	double rga_ms;           /* average RGA conversion time per frame */
 +	double frame_interval;   /* average seconds between captured frames */
 +
@@ -881,7 +889,7 @@ index 0000000..3b2a1ec
 +
 +static void stream_teardown(struct hdmirx_source *s)
 +{
-+	uint64_t captured, dropped;
++	uint64_t captured, dropped, skipped;
 +	int fd;
 +
 +	obs_enter_graphics();
@@ -889,7 +897,8 @@ index 0000000..3b2a1ec
 +	fd = s->fd;
 +	captured = s->frames_captured;
 +	dropped = s->frames_dropped;
-+	s->frames_captured = s->frames_dropped = 0;
++	skipped = s->frames_skipped;
++	s->frames_captured = s->frames_dropped = s->frames_skipped = 0;
 +	for (uint32_t i = 0; i < s->num_buffers; i++) {
 +		struct hdmirx_buffer *b = &s->buffers[i];
 +		for (int p = 0; p < 2; p++) {
@@ -910,7 +919,8 @@ index 0000000..3b2a1ec
 +	s->rga_ms = 0.0;
 +	s->frame_interval = 0.0;
 +	s->num_buffers = 0;
-+	s->ready = s->displayed = -1;
++	s->queued = 0;
++	s->displayed = -1;
 +	s->import_failed = false;
 +	memset(&s->layout, 0, sizeof(s->layout));
 +	pthread_mutex_unlock(&s->mutex);
@@ -920,7 +930,10 @@ index 0000000..3b2a1ec
 +		int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 +		xioctl(fd, VIDIOC_STREAMOFF, &type);
 +		close(fd);
-+		blog_s(s, LOG_INFO, "Capture stopped: %" PRIu64 " frames, %" PRIu64 " dropped", captured, dropped);
++		blog_s(s, LOG_INFO,
++		       "Capture stopped: %" PRIu64 " frames, %" PRIu64 " dropped, %" PRIu64
++		       " skipped (signal faster than OBS)",
++		       captured, dropped, skipped);
 +	}
 +}
 +
@@ -1225,7 +1238,8 @@ index 0000000..3b2a1ec
 +	s->timings = timings.bt;
 +	memcpy(s->buffers, buffers, sizeof(buffers));
 +	s->num_buffers = req.count;
-+	s->ready = s->displayed = -1;
++	s->queued = 0;
++	s->displayed = -1;
 +	s->import_failed = false;
 +	set_color_params(s, &fmt.fmt.pix_mp, pq, max_cll);
 +	pthread_mutex_unlock(&s->mutex);
@@ -1312,6 +1326,25 @@ index 0000000..3b2a1ec
 +	return true;
 +}
 +
++/* Counts frames that never reach the screen. When the signal runs faster than
++ * OBS renders, some have to be left out; those aren't drops. Called with the
++ * mutex held. */
++static void count_lost(struct hdmirx_source *s, uint64_t frames)
++{
++	uint64_t obs_frame_ns = video_output_get_frame_time(obs_get_video());
++
++	/* OBS didn't render (startup, a stall): it reports that as rendering lag
++	 * itself, and video_tick would have skipped these frames anyway. */
++	if (os_gettime_ns() - s->last_tick_ns > obs_frame_ns * 3 / 2) {
++		return;
++	}
++	if (s->frame_interval > 0.0 && s->frame_interval * 1e9 < (double)obs_frame_ns * 0.95) {
++		s->frames_skipped += frames;
++	} else {
++		s->frames_dropped += frames;
++	}
++}
++
 +/* Returns true when the receiver has a signal but stopped delivering frames. */
 +static bool stream_run(struct hdmirx_source *s)
 +{
@@ -1320,6 +1353,8 @@ index 0000000..3b2a1ec
 +	int idle_ms = 0;
 +	uint64_t color_checked_ns = os_gettime_ns();
 +	double last_timestamp = 0.0;
++	bool have_sequence = false;
++	uint32_t last_sequence = 0;
 +
 +	while (!s->stop) {
 +		uint64_t now = os_gettime_ns();
@@ -1418,15 +1453,27 @@ index 0000000..3b2a1ec
 +				s->frame_interval = s->frame_interval > 0.0 ? s->frame_interval * 0.95 + interval * 0.05
 +									    : interval;
 +			}
++			/* The receiver skips frames while no buffer is queued. */
++			if (have_sequence && buf.sequence - last_sequence > 1 && buf.sequence - last_sequence < 1000) {
++				count_lost(s, buf.sequence - last_sequence - 1);
++			}
++			have_sequence = true;
++			last_sequence = buf.sequence;
++
 +			if (buf.flags & V4L2_BUF_FLAG_ERROR) {
 +				queue_buffer(fd, buf.index, num_planes);
-+			} else {
-+				/* Drop the previous frame if tick hasn't picked it up yet. */
-+				if (s->ready >= 0) {
-+					queue_buffer(fd, s->ready, num_planes);
-+					s->frames_dropped++;
++				/* The first frames after STREAMON are often incomplete. */
++				if (s->frames_captured) {
++					count_lost(s, 1);
 +				}
-+				s->ready = buf.index;
++			} else {
++				/* Tick takes the frames in order, one per OBS frame. */
++				if (s->queued == MAX_QUEUED) {
++					queue_buffer(fd, s->queue[0], num_planes);
++					memmove(s->queue, s->queue + 1, --s->queued * sizeof(s->queue[0]));
++					count_lost(s, 1);
++				}
++				s->queue[s->queued++] = buf.index;
 +				s->frames_captured++;
 +			}
 +			pthread_mutex_unlock(&s->mutex);
@@ -1911,7 +1958,8 @@ index 0000000..3b2a1ec
 +
 +	s->source = source;
 +	s->fd = -1;
-+	s->ready = s->displayed = -1;
++	s->queued = 0;
++	s->displayed = -1;
 +	pthread_mutex_init(&s->mutex, NULL);
 +
 +	s->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -1965,9 +2013,17 @@ index 0000000..3b2a1ec
 +static void hdmirx_tick(void *data, float seconds)
 +{
 +	struct hdmirx_source *s = data;
-+	UNUSED_PARAMETER(seconds);
++	uint64_t obs_frame_ns = video_output_get_frame_time(obs_get_video());
++
++	/* When OBS falls behind, it skips the frames it missed; skip as many
++	 * captured frames so the latency doesn't grow. */
++	uint32_t advance = obs_frame_ns ? (uint32_t)lround(seconds * 1e9 / (double)obs_frame_ns) : 1;
++	if (advance < 1) {
++		advance = 1;
++	}
 +
 +	pthread_mutex_lock(&s->mutex);
++	s->last_tick_ns = os_gettime_ns();
 +	if (s->fd >= 0) {
 +		for (uint32_t i = 0; i < s->num_buffers; i++) {
 +			struct hdmirx_buffer *b = &s->buffers[i];
@@ -1976,12 +2032,16 @@ index 0000000..3b2a1ec
 +				queue_buffer(s->fd, i, s->layout.v4l2_planes);
 +			}
 +		}
-+		if (s->ready >= 0) {
++		for (; advance > 1 && s->queued > 1; advance--) {
++			queue_buffer(s->fd, s->queue[0], s->layout.v4l2_planes);
++			memmove(s->queue, s->queue + 1, --s->queued * sizeof(s->queue[0]));
++		}
++		if (s->queued > 0) {
 +			if (s->displayed >= 0) {
 +				s->buffers[s->displayed].retire_age = 0;
 +			}
-+			s->displayed = s->ready;
-+			s->ready = -1;
++			s->displayed = s->queue[0];
++			memmove(s->queue, s->queue + 1, --s->queued * sizeof(s->queue[0]));
 +		}
 +	}
 +	pthread_mutex_unlock(&s->mutex);
@@ -2215,6 +2275,9 @@ index 0000000..3b2a1ec
 +
 +	dstr_printf(&value, "%" PRIu64 " %s, %" PRIu64 " %s", s->frames_captured, obs_module_text("Captured"),
 +		    s->frames_dropped, obs_module_text("Dropped"));
++	if (s->frames_skipped) {
++		dstr_catf(&value, ", %" PRIu64 " %s", s->frames_skipped, obs_module_text("Skipped"));
++	}
 +	add_info(props, "frames", obs_module_text("Frames"), value.array, OBS_TEXT_INFO_NORMAL);
 +	pthread_mutex_unlock(&s->mutex);
 +

@@ -1,0 +1,21 @@
+diff --git a/libobs/obs-video-gpu-encode.c b/libobs/obs-video-gpu-encode.c
+index 283c815..9b817a7 100644
+--- a/libobs/obs-video-gpu-encode.c
++++ b/libobs/obs-video-gpu-encode.c
+@@ -250,6 +250,16 @@ bool init_gpu_encoding(struct obs_core_video_mix *video)
+ 			return false;
+ 		}
+ 
++		/* Allocating a texture can take several milliseconds (4K on Arm
++		 * Mali), and all of them together a few frames. Let the graphics
++		 * thread render in between; it doesn't touch the encoder queues
++		 * until gpu_encoder_active is set after this returns. */
++		if (i + 1 < NUM_ENCODE_TEXTURES) {
++			obs_leave_graphics();
++			os_sleep_ms(1);
++			obs_enter_graphics();
++		}
++
+ #ifdef _WIN32
+ 		uint32_t handle = gs_texture_get_shared_handle(tex);
+ #else
