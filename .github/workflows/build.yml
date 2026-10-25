@@ -196,24 +196,21 @@ jobs:
 
           title="OBS Studio $OBS + jellyfin-ffmpeg $JF"
 
+          latest=true
+          [[ "$PINNED" == true ]] && latest=false
+
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # Forced rebuild: point the tag at the commit these packages were built from.
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" \
               -f sha="$GITHUB_SHA" -F force=true >/dev/null
 
-            # Asset names carry the jellyfin-ffmpeg version, so
-            # drop the old packages rather than relying on --clobber.
-            gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
-              while read -r asset; do
-                gh release delete-asset "$TAG" "$asset" -R "$GITHUB_REPOSITORY" --yes
-              done
-            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" *.deb SHA256SUMS
-            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --title "$title" --notes-file notes.md
-            exit 0
+            # A release's publish date never changes once set, so recreate it (keeping
+            # the tag) to date it to this build. Keep its "Latest" status as it was.
+            latest=false
+            [[ "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" == "$TAG" ]] && latest=true
+            gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes
           fi
 
-          latest=true
-          [[ "$PINNED" == true ]] && latest=false
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$title" \
