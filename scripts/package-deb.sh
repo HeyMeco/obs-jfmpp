@@ -50,6 +50,9 @@ endgroup
 group "Leave the HDMI-in audio card to OBS (WirePlumber)"
 install -Dm644 "$REPO_ROOT/packaging/wireplumber-hdmiin.conf" \
   "$STAGE/usr/share/wireplumber/wireplumber.conf.d/50-obs-jfmpp-hdmiin.conf"
+# WirePlumber 0.4 (Noble) reads Lua instead; 0.5 ignores this file.
+install -Dm644 "$REPO_ROOT/packaging/wireplumber-hdmiin.lua" \
+  "$STAGE/usr/share/wireplumber/main.lua.d/51-obs-jfmpp-hdmiin.lua"
 endgroup
 
 mapfile -t elfs < <(find "$STAGE" -type f -exec file -N {} + | awk -F: '/ELF/ {print $1}')
@@ -100,13 +103,14 @@ group "Build obs-studio-rockchip $DEB_VERSION"
 installed_size="$(du -sk --exclude=DEBIAN "$STAGE" | cut -f1)"
 mkdir -p "$STAGE/DEBIAN"
 install -m755 "$REPO_ROOT/packaging/postinst" "$REPO_ROOT/packaging/postrm" "$STAGE/DEBIAN/"
+# Noble has no qt6-svg-plugins; its libqt6svg6 carries the SVG plugins.
 cat > "$STAGE/DEBIAN/control" <<CTRL
 Package: obs-studio-rockchip
 Version: $DEB_VERSION
 Architecture: $ARCH
 Maintainer: obs-jfmpp <noreply@github.com>
 Installed-Size: $installed_size
-Depends: $shlibs, qt6-qpa-plugins, qt6-svg-plugins, qt6-wayland, qt6-image-formats-plugins
+Depends: $shlibs, qt6-qpa-plugins, qt6-svg-plugins | libqt6svg6, qt6-wayland, qt6-image-formats-plugins
 Recommends: vlc-plugin-base
 Suggests: pkexec | polkitd, v4l2loopback-dkms
 Provides: obs-studio (= $DEB_VERSION)

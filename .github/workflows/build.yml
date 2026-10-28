@@ -90,6 +90,8 @@ jobs:
         include:
           - distro: trixie
             image: debian:trixie
+          - distro: noble
+            image: ubuntu:noble
           - distro: resolute
             image: ubuntu:resolute
     env:
@@ -97,18 +99,18 @@ jobs:
       JF_VERSION: ${{ needs.resolve.outputs.jf_version }}
       GITHUB_TOKEN: ${{ github.token }}
       WORK_DIR: /tmp/obs-jfmpp
-      # Keeps both distros' caches well inside the repository's 10 GB cache quota.
+      # Keeps all distros' caches well inside the repository's 10 GB cache quota.
       CCACHE_MAXSIZE: 2G
     steps:
       - uses: actions/checkout@v7
 
-      # jellyfin-ffmpeg + MPP/RGA + rkaiq only change with their versions;
-      # build-ffmpeg.sh and build-rkaiq.sh skip the build when the restored copy matches.
+      # jellyfin-ffmpeg + MPP/RGA + rkaiq (+ mbedTLS on Noble) only change with their versions;
+      # build-ffmpeg.sh, build-rkaiq.sh and build-mbedtls.sh skip the build when the restored copy matches.
       - name: Cache jellyfin-ffmpeg
         uses: actions/cache@v6
         with:
           path: /usr/lib/obs-jellyfin-ffmpeg
-          key: ffmpeg-${{ matrix.distro }}-${{ needs.resolve.outputs.jf_version }}-${{ needs.resolve.outputs.rk_commits }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'scripts/build-rkaiq.sh', 'patches/rkaiq/*') }}
+          key: ffmpeg-${{ matrix.distro }}-${{ needs.resolve.outputs.jf_version }}-${{ needs.resolve.outputs.rk_commits }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'scripts/build-rkaiq.sh', 'scripts/build-mbedtls.sh', 'patches/rkaiq/*') }}
 
       # Compiler cache for whatever does get built (OBS, mostly). Saved under a new key
       # each run and restored from the newest entry, preferring the same OBS release.
@@ -142,6 +144,8 @@ jobs:
         include:
           - distro: trixie
             image: debian:trixie
+          - distro: noble
+            image: ubuntu:noble
           - distro: resolute
             image: ubuntu:resolute
     steps:

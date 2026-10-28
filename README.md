@@ -9,6 +9,7 @@ Rockchip MPP hardware encoding and decoding and RGA 2D acceleration enabled.
 | Target | Container image |
 |--------|-----------------|
 | Debian 13 Trixie | `debian:trixie` |
+| Ubuntu 24.04 Noble Numbat | `ubuntu:noble` |
 | Ubuntu 26.04 Resolute Raccoon | `ubuntu:resolute` |
 
 Prebuilt packages are on the [Releases](../../releases) page.
@@ -16,7 +17,7 @@ Prebuilt packages are on the [Releases](../../releases) page.
 ## Install
 
 ```sh
-sudo apt install ./obs-studio-rockchip_<obs>-jf<jellyfin-ffmpeg>_<trixie|resolute>_arm64.deb
+sudo apt install ./obs-studio-rockchip_<obs>-jf<jellyfin-ffmpeg>_<trixie|noble|resolute>_arm64.deb
 ```
 
 The package is named `obs-studio-rockchip`. It provides `obs-studio` and replaces the distro's
@@ -213,8 +214,9 @@ always uses the two RGA3 cores.
   retries forever and floods the log with `snd_pcm_status error: File descriptor in bad
   state` (tens of thousands of lines a minute, enough to fill Armbian's `/var/log`). So the
   package installs a WirePlumber rule
-  (`/usr/share/wireplumber/wireplumber.conf.d/50-obs-jfmpp-hdmiin.conf`) that keeps PipeWire
-  away from that card. It applies after logging in again or `systemctl --user restart
+  (`/usr/share/wireplumber/wireplumber.conf.d/50-obs-jfmpp-hdmiin.conf`, and
+  `/usr/share/wireplumber/main.lua.d/51-obs-jfmpp-hdmiin.lua` for Noble's WirePlumber 0.4)
+  that keeps PipeWire away from that card. It applies after logging in again or `systemctl --user restart
   wireplumber`. Don't add the HDMI-in device as *Audio Input Capture*; with the rule in place
   it isn't offered anymore. While PipeWire still holds the card, Properties say so.
 
@@ -316,6 +318,22 @@ the folder with the highest version that is not newer than the OBS being built: 
 build fails at "Apply patches"; refresh the series against the new tag into a new folder named
 after it, and keep the old folder so older releases still build.
 
+### Ubuntu Noble
+
+OBS 33 targets newer libraries than Noble has, so the Noble build adds a few things:
+
+- **Qt 6.4**: OBS 33 needs Qt 6.9 upstream. `0005` and `0008` guard the few newer Qt calls
+  with `QT_VERSION` checks, and with Qt older than 6.7, `build-obs.sh` routes OBS's
+  `QMetaObject::invokeMethod(object, &Class::method, args...)` calls (about 110, a Qt 6.7
+  overload) through [`patches/qt64/obs-qt64-compat.hpp`](patches/qt64/obs-qt64-compat.hpp),
+  which wraps them in a functor. New OBS releases mostly add calls of that kind, which the
+  shim already handles.
+- **mbedTLS 3**: Noble has 2.28. `scripts/build-mbedtls.sh` builds mbedTLS 3.6 LTS and OBS
+  links it statically. On Trixie and Resolute it does nothing.
+- **WirePlumber 0.4**: it reads Lua instead of `wireplumber.conf.d`, so the package also ships
+  the HDMI-in rule as `main.lua.d/51-obs-jfmpp-hdmiin.lua`.
+- The SVG plugins are in `libqt6svg6` instead of `qt6-svg-plugins`.
+
 CEF follows the OBS release: the build reads the CEF version, revision and SHA-256 for
 `ubuntu-aarch64` from that release's `CMakePresets.json`, so obs-browser and CEF always match.
 OBS 32.2.x pins CEF 6533 (Chromium 127) and OBS 33 pins 7871 (Chromium 150). To force a different build, set `CEF_VERSION`,
@@ -327,7 +345,7 @@ obs-browser may not compile.
 Needs Docker on an arm64 host (or with arm64 emulation, which is much slower):
 
 ```sh
-./scripts/docker-build.sh trixie     # or: resolute
+./scripts/docker-build.sh trixie     # or: noble, resolute
 OBS_VERSION=32.2.2 JF_VERSION=v8.1.3-1 ./scripts/docker-build.sh trixie
 ```
 
@@ -342,7 +360,7 @@ version, the MPP/RGA branch heads or `build-ffmpeg.sh` change, and rkaiq when it
 
 On macOS, Colima with `--vm-type vz --mount-type virtiofs` is much faster than QEMU/sshfs.
 
-Inside a Trixie/Resolute arm64 system or container you can run
+Inside a Trixie/Noble/Resolute arm64 system or container you can run
 `./scripts/build.sh` directly (uses `sudo` for apt and for creating
 `/usr/lib/obs-jellyfin-ffmpeg`).
 
@@ -351,6 +369,7 @@ Inside a Trixie/Resolute arm64 system or container you can run
 | `scripts/install-deps.sh` | apt build dependencies (no distro `libav*-dev`) |
 | `scripts/build-ffmpeg.sh` | Rockchip MPP + RGA, then jellyfin-ffmpeg with its patch series applied |
 | `scripts/build-rkaiq.sh` | Rockchip's camera 3A engine (rkaiq) for the RK3588 ISP with `patches/rkaiq`, plus the RK3588 tuning files |
+| `scripts/build-mbedtls.sh` | mbedTLS 3 (static) where the distro only has 2.x (Noble) |
 | `scripts/build-obs.sh` | applies `patches/obs-studio/<version>`, fetches and verifies CEF, builds OBS Studio against that FFmpeg, staged install |
 | `scripts/package-deb.sh` | bundles FFmpeg, computes `Depends` with `dpkg-shlibdeps`, builds the `.deb` |
 | `scripts/test-deb.sh` | installs the `.deb` and checks the rkmpp codecs and library resolution |

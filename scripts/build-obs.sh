@@ -20,11 +20,23 @@ OBS_SRC="$SRC_DIR/obs-studio"
 # Start from a pristine tree so re-runs (and patch updates) apply cleanly.
 git -C "$OBS_SRC" reset -q --hard HEAD
 git -C "$OBS_SRC" clean -qfd
+# Some patches touch submodules (obs-websocket), which the above leaves alone.
+git -C "$OBS_SRC" submodule foreach --quiet --recursive 'git reset -q --hard HEAD && git clean -qfd'
 for patch in "$PATCH_DIR"/*.patch; do
   echo "$(basename "$patch")"
   git -C "$OBS_SRC" apply --whitespace=nowarn "$patch" \
     || die "$(basename "$patch") does not apply to OBS $OBS_VERSION; refresh it"
 done
+# OBS calls QMetaObject::invokeMethod with a method and its arguments, which needs
+# Qt 6.7; Noble has 6.4. Route those calls through patches/qt64/obs-qt64-compat.hpp.
+qt_version="$(dpkg-query -W -f='${Version}' qt6-base-dev)"
+if dpkg --compare-versions "$qt_version" lt 6.7; then
+  echo "Qt $qt_version: using patches/qt64/obs-qt64-compat.hpp"
+  grep -rlZ --include='*.cpp' --include='*.hpp' --include='*.h' --exclude-dir=deps \
+    'QMetaObject::invokeMethod(' "$OBS_SRC" \
+    | xargs -0 -r sed -i -e 's/QMetaObject::invokeMethod(/ObsQtCompat::invokeMethod(/g' \
+      -e "1i #include \"$REPO_ROOT/patches/qt64/obs-qt64-compat.hpp\""
+fi
 endgroup
 
 group "Chromium Embedded Framework"

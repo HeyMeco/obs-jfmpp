@@ -1,0 +1,117 @@
+diff --git a/shared/properties-view/properties-view.cpp b/shared/properties-view/properties-view.cpp
+index c41fc79..3b2c9db 100644
+--- a/shared/properties-view/properties-view.cpp
++++ b/shared/properties-view/properties-view.cpp
+@@ -275,7 +275,11 @@ QWidget *OBSPropertiesView::AddCheckbox(obs_property_t *prop)
+ 	QCheckBox *checkbox = new QCheckBox(QT_UTF8(desc));
+ 	checkbox->setCheckState(val ? Qt::Checked : Qt::Unchecked);
+ 
++#if QT_VERSION < QT_VERSION_CHECK(6, 7, 0)
++	QWidget *widget = NewWidget(prop, checkbox, &QCheckBox::stateChanged);
++#else
+ 	QWidget *widget = NewWidget(prop, checkbox, &QCheckBox::checkStateChanged);
++#endif
+ 
+ 	if (!long_desc) {
+ 		return widget;
+diff --git a/shared/qt/wrappers/qt-wrappers.cpp b/shared/qt/wrappers/qt-wrappers.cpp
+index 3a67588..a0e7cfb 100644
+--- a/shared/qt/wrappers/qt-wrappers.cpp
++++ b/shared/qt/wrappers/qt-wrappers.cpp
+@@ -90,7 +90,9 @@ void OBSMessageBox::warning(QWidget *parent, const QString &title, const QString
+ 	QMessageBox mb(QMessageBox::Warning, title, text, QMessageBox::NoButton, parent);
+ 	if (enableRichText) {
+ 		mb.setTextFormat(Qt::RichText);
++#if QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
+ 		mb.setOption(QMessageBox::Option::DontUseNativeDialog, true);
++#endif
+ 	}
+ 	mb.addButton(tr("OK"), QMessageBox::AcceptRole);
+ 	mb.exec();
+diff --git a/plugins/obs-websocket/src/forms/SettingsDialog.cpp b/plugins/obs-websocket/src/forms/SettingsDialog.cpp
+index 9514bd1..17e7a83 100644
+--- a/plugins/obs-websocket/src/forms/SettingsDialog.cpp
++++ b/plugins/obs-websocket/src/forms/SettingsDialog.cpp
+@@ -68,8 +68,13 @@ SettingsDialog::SettingsDialog(QWidget *parent)
+ 
+ 	connect(sessionTableTimer, &QTimer::timeout, this, &SettingsDialog::FillSessionTable);
+ 	connect(ui->buttonBox, &QDialogButtonBox::clicked, this, &SettingsDialog::DialogButtonClicked);
++#if QT_VERSION < QT_VERSION_CHECK(6, 7, 0)
++	connect(ui->enableAuthenticationCheckBox, &QCheckBox::stateChanged, this,
++		&SettingsDialog::EnableAuthenticationCheckBoxChanged);
++#else
+ 	connect(ui->enableAuthenticationCheckBox, &QCheckBox::checkStateChanged, this,
+ 		&SettingsDialog::EnableAuthenticationCheckBoxChanged);
++#endif
+ 	connect(ui->generatePasswordButton, &QPushButton::clicked, this, &SettingsDialog::GeneratePasswordButtonClicked);
+ 	connect(ui->showConnectInfoButton, &QPushButton::clicked, this, &SettingsDialog::ShowConnectInfoButtonClicked);
+ 	connect(ui->serverPasswordLineEdit, &QLineEdit::textEdited, this, &SettingsDialog::PasswordEdited);
+diff --git a/frontend/OBSApp.cpp b/frontend/OBSApp.cpp
+--- a/frontend/OBSApp.cpp
++++ b/frontend/OBSApp.cpp
+@@ -40,6 +40,9 @@
+ #endif
+ 
+ #include <QSessionManager>
++#if defined(ENABLE_WAYLAND) && QT_VERSION < QT_VERSION_CHECK(6, 5, 0)
++#include <qpa/qplatformnativeinterface.h>
++#endif
+ #ifndef _WIN32
+ #include <QSocketNotifier>
+ #endif
+@@ -125,7 +128,9 @@
+ 	QMessageBox crashWarning;
+ 
+ 	crashWarning.setIcon(QMessageBox::Warning);
++#if QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
+ 	crashWarning.setOption(QMessageBox::Option::DontUseNativeDialog);
++#endif
+ 	crashWarning.setWindowTitle(QTStr("CrashHandling.Dialog.Title"));
+ 	crashWarning.setText(QTStr("CrashHandling.Labels.Text"));
+ 
+@@ -1290,9 +1295,15 @@
+ 
+ #ifdef ENABLE_WAYLAND
+ 	if (QApplication::platformName().contains("wayland")) {
++#if QT_VERSION < QT_VERSION_CHECK(6, 5, 0)
++		// Qt before 6.5 has no QNativeInterface::QWaylandApplication.
++		QPlatformNativeInterface *native = QGuiApplication::platformNativeInterface();
++		obs_set_nix_platform_display(native->nativeResourceForIntegration("display"));
++#else
+ 		auto native = qGuiApp->nativeInterface<QNativeInterface::QWaylandApplication>();
+ 
+ 		obs_set_nix_platform_display(native->display());
++#endif
+ 
+ 		obs_set_nix_platform(OBS_NIX_PLATFORM_WAYLAND);
+ 		setAttribute(Qt::AA_DontCreateNativeWidgetSiblings);
+diff --git a/frontend/dialogs/OBSBasicTransform.cpp b/frontend/dialogs/OBSBasicTransform.cpp
+--- a/frontend/dialogs/OBSBasicTransform.cpp
++++ b/frontend/dialogs/OBSBasicTransform.cpp
+@@ -92,7 +92,11 @@
+ 	hookWidget(ui->cropRight, ISCROLL_CHANGED, &OBSBasicTransform::onCropChanged);
+ 	hookWidget(ui->cropTop, ISCROLL_CHANGED, &OBSBasicTransform::onCropChanged);
+ 	hookWidget(ui->cropBottom, ISCROLL_CHANGED, &OBSBasicTransform::onCropChanged);
++#if QT_VERSION < QT_VERSION_CHECK(6, 7, 0)
++	hookWidget(ui->cropToBounds, &QCheckBox::stateChanged, &OBSBasicTransform::onControlChanged);
++#else
+ 	hookWidget(ui->cropToBounds, &QCheckBox::checkStateChanged, &OBSBasicTransform::onControlChanged);
++#endif
+ 	ui->buttonBox->button(QDialogButtonBox::Close)->setDefault(true);
+ 
+ 	connect(ui->buttonBox->button(QDialogButtonBox::Reset), &QPushButton::clicked, main,
+diff --git a/frontend/settings/OBSBasicSettings.cpp b/frontend/settings/OBSBasicSettings.cpp
+--- a/frontend/settings/OBSBasicSettings.cpp
++++ b/frontend/settings/OBSBasicSettings.cpp
+@@ -776,7 +776,11 @@
+ 	connect(ui->simpleOutputABitrate, &QComboBox::currentIndexChanged, this,
+ 		&OBSBasicSettings::SimpleReplayBufferChanged);
+ 	connect(ui->simpleRBSecMax, &QSpinBox::valueChanged, this, &OBSBasicSettings::SimpleReplayBufferChanged);
++#if QT_VERSION < QT_VERSION_CHECK(6, 7, 0)
++	connect(ui->advOutSplitFile, &QCheckBox::stateChanged, this, &OBSBasicSettings::AdvOutSplitFileChanged);
++#else
+ 	connect(ui->advOutSplitFile, &QCheckBox::checkStateChanged, this, &OBSBasicSettings::AdvOutSplitFileChanged);
++#endif
+ 	connect(ui->advOutSplitFileType, &QComboBox::currentIndexChanged, this,
+ 		&OBSBasicSettings::AdvOutSplitFileChanged);
+ 	connect(ui->advReplayBuf, &QCheckBox::toggled, this, &OBSBasicSettings::AdvReplayBufferChanged);

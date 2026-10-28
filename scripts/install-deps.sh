@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install build dependencies on Debian Trixie / Ubuntu Resolute (arm64).
+# Install build dependencies on Debian Trixie / Ubuntu Noble / Ubuntu Resolute (arm64).
 # Deliberately does NOT install the distro libav*-dev packages: OBS must only
 # ever see jellyfin-ffmpeg's headers and pkg-config files.
 source "$(dirname "$0")/common.sh"
@@ -48,6 +48,7 @@ ffmpeg_deps=(
   libopus-dev libmp3lame-dev libvorbis-dev libwebp-dev
   libass-dev libfreetype-dev libfontconfig-dev libfribidi-dev libharfbuzz-dev
   libzimg-dev libsrt-openssl-dev
+  libssl-dev  # srt.pc requires openssl, and Noble's libsrt-openssl-dev doesn't depend on it
 )
 
 # Mirrors obs-studio's .github/scripts/utils.zsh/setup_ubuntu, minus FFmpeg,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local build in a disposable arm64 container: ./scripts/docker-build.sh trixie|resolute
+# Local build in a disposable arm64 container: ./scripts/docker-build.sh trixie|noble|resolute
 #
 # Runs in a builder image (the distro plus install-deps.sh), rebuilt only when
 # install-deps.sh changes. Everything worth keeping lives in _build/<distro> on the
@@ -9,8 +9,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 case "${1:-}" in
   trixie) image=debian:trixie ;;
+  noble) image=ubuntu:noble ;;
   resolute) image=ubuntu:resolute ;;
-  *) echo "usage: $0 trixie|resolute" >&2; exit 2 ;;
+  *) echo "usage: $0 trixie|noble|resolute" >&2; exit 2 ;;
 esac
 
 repo=obs-jfmpp-builder
