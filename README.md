@@ -244,7 +244,8 @@ converts to RGB in a shader.
   1920x1080 or 1280x720 scaled down by the ISP.
 - **Frame rate**: the sensor's rate (30 fps for the IMX415) by default, fixed so OBS gets a
   steady stream. The sensor driver's mode sets the highest rate: the stock IMX415 driver has
-  no mode faster than 30 fps on the 4-lane connection, and rkaiq can only slow a mode down.
+  no mode faster than 30 fps on the 4-lane connection, and rkaiq can only slow a mode down
+  (see [4K at 60 fps](#imx415-at-4k60) for a kernel that has a faster mode).
   Lower fixed rates are available, and *Variable* lets the camera lengthen the
   exposure in low light at the cost of a lower, changing frame rate.
 - **Anti-flicker** (50 Hz by default, as in Rockchip's tuning; 60 Hz in the Americas) keeps
@@ -269,6 +270,21 @@ converts to RGB in a shader.
   vendor 6.12 kernel (RT group scheduling); the bundled build falls back to normal scheduling
   instead of running without exposure and white balance control.
 - Supported on the RK3588 (ISP 3.0). Only one source can use a camera at a time.
+
+#### IMX415 at 4K60
+
+[`patches/kernel`](patches/kernel) has patches for Armbian's `vendor` (6.1) and
+`vendor-next` (6.12) kernels that run the IMX415 at 4K60, after
+[bambooCZ/rk3588-imx415-4k60](https://github.com/bambooCZ/rk3588-imx415-4k60). Copy the
+directory for the kernel into Armbian's build tree as
+`userpatches/kernel/rk35xx-vendor-6.1/` or `userpatches/kernel/rk35xx-vendor-6.12/` and
+build the kernel (`./compile.sh kernel BOARD=... BRANCH=vendor` or `BRANCH=vendor-next`).
+
+- `0001`: the RK3588 D-PHY calibrates its receiver from 1400 Mbps instead of above 1500;
+  without it the 1485 Mbps link fails the CRC of most lines.
+- `0002`: the IMX415 driver gets a 4K60 mode (1485 Mbps) on the 4-lane connection, used by
+  default with the stock camera overlay. `imx415.max_fps=30` on the kernel command line
+  (`extraargs=` in `/boot/armbianEnv.txt`) brings back the stock 4K30 mode.
 
 ## Automation
 

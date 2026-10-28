@@ -1,0 +1,33 @@
+From 7b0a4dc6fa0587ec0283aba530109b81e0b4b84a Mon Sep 17 00:00:00 2001
+From: Mecid <mecidi.cc@gmail.com>
+Date: Sun, 25 Oct 2026 17:29:50 +0100
+Subject: [PATCH 1/2] phy: rockchip: csi2-dphy-hw: calibrate the receiver from
+ 1400 Mbps
+
+Receiver calibration was only enabled above 1500 Mbps. An IMX415 at
+1485 Mbps (4K60 over 4 lanes) fails the CRC of nearly every line on
+RK3588 without it (64000 to 132000 CSI-2 errors per second) and has
+none with it. Enable it for the whole hsfreq range that 1500 Mbps is
+in (1400 to 1599 Mbps, settle 0x2d).
+---
+ drivers/phy/rockchip/phy-rockchip-csi2-dphy-hw.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/phy/rockchip/phy-rockchip-csi2-dphy-hw.c b/drivers/phy/rockchip/phy-rockchip-csi2-dphy-hw.c
+index 916ad049d..4a8108d22 100644
+--- a/drivers/phy/rockchip/phy-rockchip-csi2-dphy-hw.c
++++ b/drivers/phy/rockchip/phy-rockchip-csi2-dphy-hw.c
+@@ -1022,8 +1022,11 @@ static int csi2_dphy_hw_stream_on(struct csi2_dphy *dphy,
+ 	/* not into receive mode/wait stopstate */
+ 	write_grf_reg(hw, GRF_DPHY_CSI2PHY_FORCERXMODE, 0x0);
+ 
+-	/* enable calibration */
+-	if (dphy->data_rate_mbps > 1500) {
++	/*
++	 * enable calibration: at 1400 Mbps and above, the hsfreq range of
++	 * 1500 Mbps; an IMX415 at 1485 Mbps fails CRC on most lines without it
++	 */
++	if (dphy->data_rate_mbps >= 1400) {
+ 		if (hw->lane_mode == LANE_MODE_FULL) {
+ 			write_csi2_dphy_reg(hw, CSI2PHY_CLK_CALIB_ENABLE, 0x80);
+ 			if (sensor->lanes > 0x00)

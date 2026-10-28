@@ -1,0 +1,160 @@
+From aa1571d4624e43c4f0cd5cc7e138e444c2ff547f Mon Sep 17 00:00:00 2001
+From: Mecid <mecidi.cc@gmail.com>
+Date: Sun, 25 Oct 2026 17:29:50 +0100
+Subject: [PATCH 2/2] media: i2c: imx415: add a 4K 60 fps linear mode
+
+Add a 3864x2192 10-bit linear 4-lane mode at 60 fps and 1485 Mbps:
+HMAX 0x210 (7.111 us) x VMAX 2344, which leaves 1.08 ms of vertical
+blanking; rkcif wants at least 1 ms with the ISP online and repeats
+timestamps with less.
+
+The lane-rate registers are those of the driver's 1485M HDR tables,
+which agree with mainline's 1485 Mbps / 37.125 MHz clock settings, and
+so are its D-PHY timings. The mode needs receiver calibration on the
+RK3588 D-PHY.
+
+rkaiq takes the first mode of a size, so the new mode leads the table
+and is the default. imx415.max_fps=30 on the kernel command line drops
+it at probe and brings back the stock 4K30 mode.
+
+Based on https://github.com/bambooCZ/rk3588-imx415-4k60
+---
+ drivers/media/i2c/imx415.c | 90 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 89 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/i2c/imx415.c b/drivers/media/i2c/imx415.c
+index f94d55826..5f7adfcfc 100644
+--- a/drivers/media/i2c/imx415.c
++++ b/drivers/media/i2c/imx415.c
+@@ -29,6 +29,9 @@
+  * 3. enum all supported mode mbus_code, not just cur_mode.
+  * V0.0X01.0X08
+  * 1. add dcphy param for hdrx2 mode.
++ * V0.0X01.0X09
++ * 1. add 3864x2192 10bit linear 60fps 1485Mbps 4lane mode, the default;
++ *    max_fps=30 drops it.
+  */
+ 
+ #define DEBUG
+@@ -56,7 +59,7 @@
+ #include "cam-tb-setup.h"
+ #include "cam-sleep-wakeup.h"
+ 
+-#define DRIVER_VERSION			KERNEL_VERSION(0, 0x01, 0x08)
++#define DRIVER_VERSION			KERNEL_VERSION(0, 0x01, 0x09)
+ 
+ #ifndef V4L2_CID_DIGITAL_GAIN
+ #define V4L2_CID_DIGITAL_GAIN		V4L2_CID_GAIN
+@@ -687,6 +690,49 @@ static __maybe_unused const struct regval imx415_linear_10bit_3864x2192_891M_reg
+ 	{REG_NULL, 0x00},
+ };
+ 
++/*
++ * 4K60: the 891M linear table with the lane rate at 1485 Mbps (SYS_MODE 0x3033,
++ * INCKSEL3 0x3118, INCKSEL6 0x400C, INCKSEL7 0x4074 and the D-PHY timings
++ * 0x4018..0x4028 from the 1485M HDR tables above). HMAX 0x210 is as short as
++ * the link allows a 3864 pixel line (1H = 528 / 74.25 MHz = 7.111 us), so that
++ * VMAX 0x928 (2344, 16.67 ms) leaves 152 lines = 1.08 ms of vertical blanking:
++ * rkcif wants at least 1 ms with the ISP online.
++ */
++static __maybe_unused const struct regval imx415_linear_10bit_3864x2192_1485M_regs[] = {
++	{0x3020, 0x00},
++	{0x3021, 0x00},
++	{0x3022, 0x00},
++	{0x3024, 0x28},
++	{0x3025, 0x09},
++	{0x3028, 0x10},
++	{0x3029, 0x02},
++	{0x302C, 0x00},
++	{0x302D, 0x00},
++	{0x3033, 0x08},
++	{0x3050, 0x08},
++	{0x3051, 0x00},
++	{0x3054, 0x19},
++	{0x3058, 0x3E},
++	{0x3060, 0x25},
++	{0x3064, 0x4a},
++	{0x30CF, 0x00},
++	{0x3118, 0xA0},
++	{0x3260, 0x01},
++	{0x400C, 0x01},
++	{0x4018, 0xA7},
++	{0x401A, 0x57},
++	{0x401C, 0x5F},
++	{0x401E, 0x97},
++	{0x401F, 0x01},
++	{0x4020, 0x5F},
++	{0x4022, 0xAF},
++	{0x4024, 0x5F},
++	{0x4026, 0x9F},
++	{0x4028, 0x4F},
++	{0x4074, 0x00},
++	{REG_NULL, 0x00},
++};
++
+ static __maybe_unused const struct regval imx415_linear_12bit_1932x1096_594M_regs[] = {
+ 	{0x3020, 0x01},
+ 	{0x3021, 0x01},
+@@ -1083,6 +1129,30 @@ static __maybe_unused const struct regval imx415_linear_12bit_1284x720_2376M_reg
+  * }
+  */
+ static const struct imx415_mode supported_modes[] = {
++	/*
++	 * The 60 fps linear 4K mode leads the table: probe drops it when
++	 * max_fps is lower, and the first mode of a size is the one used.
++	 * hts_def is the line length at the pixel rate of the link frequency.
++	 */
++	{
++		.bus_fmt = MEDIA_BUS_FMT_SGBRG10_1X10,
++		.width = 3864,
++		.height = 2192,
++		.max_fps = {
++			.numerator = 10000,
++			.denominator = 600000,
++		},
++		.exp_def = 0x0928 - 0x08,
++		.hts_def = 4227,
++		.vts_def = 0x0928,
++		.global_reg_list = imx415_global_10bit_3864x2192_regs,
++		.reg_list = imx415_linear_10bit_3864x2192_1485M_regs,
++		.hdr_mode = NO_HDR,
++		.mipi_freq_idx = 2,
++		.bpp = 10,
++		.vc[PAD0] = 0,
++		.xvclk = IMX415_XVCLK_FREQ_37M,
++	},
+ 	/*
+ 	 * frame rate = 1 / (Vtt * 1H) = 1 / (VMAX * 1H)
+ 	 * VMAX >= (PIX_VWIDTH / 2) + 46 = height + 46
+@@ -1354,6 +1424,13 @@ static const s64 link_freq_items[] = {
+ 	MIPI_FREQ_1188M,
+ };
+ 
++/* the number of fast modes at the head of supported_modes */
++#define IMX415_FAST_MODES		1
++
++static unsigned int max_fps = 60;
++module_param(max_fps, uint, 0444);
++MODULE_PARM_DESC(max_fps, "highest frame rate of the 4-lane linear 4K mode: 30 or 60 (default)");
++
+ /* Write registers up to 4 at a time */
+ static int imx415_write_reg(struct i2c_client *client, u16 reg,
+ 			    u32 len, u32 val)
+@@ -3218,6 +3295,17 @@ static int imx415_probe(struct i2c_client *client,
+ 	if (imx415->bus_cfg.bus.mipi_csi2.num_data_lanes == IMX415_4LANES) {
+ 		imx415->supported_modes = supported_modes;
+ 		imx415->cfg_num = ARRAY_SIZE(supported_modes);
++		for (i = 0; i < IMX415_FAST_MODES; i++) {
++			const struct imx415_mode *mode = &supported_modes[i];
++
++			if (mode->max_fps.denominator / mode->max_fps.numerator <= max_fps)
++				break;
++		}
++		imx415->supported_modes += i;
++		imx415->cfg_num -= i;
++		dev_info(dev, "max_fps %u: linear 4K at %u fps\n", max_fps,
++			 imx415->supported_modes[0].max_fps.denominator /
++			 imx415->supported_modes[0].max_fps.numerator);
+ 	} else {
+ 		imx415->supported_modes = supported_modes_2lane;
+ 		imx415->cfg_num = ARRAY_SIZE(supported_modes_2lane);
